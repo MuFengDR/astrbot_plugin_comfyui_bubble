@@ -3064,7 +3064,7 @@ class ComfyUIPlugin(Star):
                 if idx > 1:
                     lines.append("")
                 lines.append(f"『{idx}』")
-                lines.append(f"> {w['name']}")
+                lines.append(f"> {w['name']} ")
                 lines.append("")
                 lines.append("```")
                 lines.extend(_escape_telegram_code_block_text(desc).splitlines())
