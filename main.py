@@ -3076,8 +3076,7 @@ class ComfyUIPlugin(Star):
                 lines.append(f"> {w['name']}")
                 lines.append("")
                 lines.append("```")
-                list_desc = f"{desc}\n\n{_format_workflow_required_params(w)}"
-                lines.extend(_escape_telegram_code_block_text(list_desc).splitlines())
+                lines.extend(_escape_telegram_code_block_text(desc).splitlines())
                 lines.append("```")
             yield event.plain_result("\n".join(lines))
             return
