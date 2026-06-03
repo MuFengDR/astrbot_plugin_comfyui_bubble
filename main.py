@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import tempfile
+import time
 import uuid
 
 import aiohttp
@@ -209,7 +210,7 @@ def _apply_input_rule(values: List[Any], rule: Dict[str, Any], label: str) -> tu
     limit = max(0, int(limit))
     count = len(values)
     if mode == "strict" and count != limit:
-        return False, values, f"{label}需要 {limit} 个，当前提供 {count} 个。"
+        return False, values, f"{label}需要严格输入 {limit} 个，当前提供 {count} 个。"
     if mode != "strict" and count > limit:
         return True, values[:limit], ""
     return True, values, ""
@@ -223,6 +224,33 @@ def _apply_workflow_input_rules(info: Dict[str, Any], texts: List[str], images: 
     ok_videos, videos, msg_videos = _apply_input_rule(videos, inputs.get("video", {}), "视频")
     messages = [m for m in (msg_texts, msg_images, msg_videos) if m]
     return ok_texts and ok_images and ok_videos, texts, images, videos, " ".join(messages)
+
+
+def _workflow_input_mismatch_message(
+    workflow_name: str,
+    candidates: List[Dict[str, Any]],
+    text_count: int,
+    image_count: int,
+    video_count: int,
+) -> str:
+    details: List[str] = []
+    sample_texts = [""] * text_count
+    sample_images = [""] * image_count
+    sample_videos = [""] * video_count
+    for item in candidates:
+        ok, _, _, _, msg = _apply_workflow_input_rules(
+            item, list(sample_texts), list(sample_images), list(sample_videos)
+        )
+        if ok:
+            continue
+        filename = item.get("filename") or "workflow.json"
+        details.append(f"- {filename}: {msg or '输入数量不符合该工作流设置。'}")
+    suffix = ("\n" + "\n".join(details)) if details else ""
+    return (
+        f"工作流「{workflow_name}」存在，但入参数量不符合条件。"
+        f"当前提供：文本{text_count}，图片{image_count}，视频{video_count}。"
+        + suffix
+    )
 
 
 async def _load_workflow_descriptions(config: Any) -> Dict[str, str]:
@@ -339,11 +367,11 @@ def _load_ports_config_file() -> Optional[List[Dict[str, Any]]]:
         if not isinstance(raw_ports, list):
             return None
         ports: List[Dict[str, Any]] = []
-        for idx, item in enumerate(raw_ports[:4], start=1):
+        for idx, item in enumerate(raw_ports, start=1):
             port = _normalize_comfyui_port_entry(item, idx)
             if port:
                 ports.append(port)
-        return ports or None
+        return ports
     except Exception as e:
         logger.warning("ComfyUI read ports config failed: %s", e)
         return None
@@ -351,7 +379,7 @@ def _load_ports_config_file() -> Optional[List[Dict[str, Any]]]:
 
 def _save_ports_config_file(ports: List[Dict[str, Any]]) -> None:
     normalized: List[Dict[str, Any]] = []
-    for idx, item in enumerate((ports or [])[:4], start=1):
+    for idx, item in enumerate((ports or []), start=1):
         port = _normalize_comfyui_port_entry(item, idx)
         if port:
             normalized.append(port)
@@ -363,6 +391,7 @@ def _save_ports_config_file(ports: List[Dict[str, Any]]) -> None:
 
 
 def _get_schema_comfyui_ports(config: Any) -> List[Dict[str, Any]]:
+    """Read legacy 1-4 interface fields for first-run migration only."""
     ports: List[Dict[str, Any]] = []
     for idx in range(1, 5):
         name = str(_config_get(config, f"comfyui_port_{idx}_name", "") or "").strip()
@@ -381,7 +410,8 @@ def _get_schema_comfyui_ports(config: Any) -> List[Dict[str, Any]]:
 
 
 def _get_comfyui_ports(config: Any) -> List[Dict[str, Any]]:
-    return _load_ports_config_file() or _get_schema_comfyui_ports(config)
+    ports = _load_ports_config_file()
+    return ports if ports is not None else _get_schema_comfyui_ports(config)
 
 
 def _read_active_port_name() -> str:
@@ -405,6 +435,8 @@ def _write_active_port_name(name: str) -> None:
 
 def _get_active_comfyui_port(config: Any) -> Dict[str, Any]:
     ports = _get_comfyui_ports(config)
+    if not ports:
+        return {"name": "", "http": "", "workflows": []}
     preferred = _read_active_port_name()
     if preferred:
         for port in ports:
@@ -413,12 +445,30 @@ def _get_active_comfyui_port(config: Any) -> Dict[str, Any]:
     return ports[0]
 
 
+def _sync_active_interface_config(config: Any, persist: bool = False) -> None:
+    """Best-effort sync for read-only fields shown by AstrBot's config page."""
+    try:
+        active = _get_active_comfyui_port(config or {})
+        if isinstance(config, dict):
+            config["comfyui_active_interface_name"] = active.get("name", "")
+            config["comfyui_active_interface_http"] = active.get("http", "")
+        else:
+            setattr(config, "comfyui_active_interface_name", active.get("name", ""))
+            setattr(config, "comfyui_active_interface_http", active.get("http", ""))
+        if persist and hasattr(config, "save_config"):
+            config.save_config()
+    except Exception:
+        pass
+
+
 def _workflow_allowed_for_port(workflow: Dict[str, Any], port: Dict[str, Any]) -> bool:
     allowed = port.get("workflows") or []
     return not allowed or workflow.get("name") in allowed
 
 
 def _filter_workflows_for_port(workflows: List[Dict[str, Any]], port: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not (port.get("name") and port.get("http")):
+        return []
     return [w for w in workflows if _workflow_allowed_for_port(w, port)]
 
 
@@ -1251,9 +1301,9 @@ async def _submit_comfyui_workflow(
         return {
             "ok": False,
             "message": (
-                f"当前 ComfyUI 来源「{active_port['name']}」不允许使用工作流「{workflow_name}」。\n"
-                f"当前来源可用工作流：{available_text}\n"
-                "可以使用 /comfyuiport <name> 切换到其他来源，或在插件配置中调整该来源的可用工作流。"
+                f"当前 ComfyUI 接口「{active_port['name']}」不允许使用工作流「{workflow_name}」。\n"
+                f"当前接口可用工作流：{available_text}\n"
+                "可以使用 /comfyui_port <接口名称> 切换到其他接口，或在 Management page 中调整该接口的可用工作流。"
             ),
         }
     images_b64 = await _extract_images_from_event_async(event) if event else []
@@ -1269,20 +1319,16 @@ async def _submit_comfyui_workflow(
     if not workflow_file:
         matching_names = [w for w in workflows if w["name"] == workflow_name]
         if matching_names:
-            required = []
-            for w in matching_names:
-                required.append(f"'{w['filename']}'")
-            if required:
-                return {
-                    "ok": False,
-                    "message": (
-                        f"工作流「{workflow_name}」存在，但参数数量不匹配。"
-                        f"当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}。\n"
-                        "同名工作流文件：\n"
-                        + "\n".join(f"- {r}" for r in required)
-                        + "\n请检查工作流说明或在管理页调整参数配置。"
-                    ),
-                }
+            return {
+                "ok": False,
+                "message": _workflow_input_mismatch_message(
+                    workflow_name,
+                    matching_names,
+                    len(texts),
+                    len(images_b64),
+                    len(videos),
+                ),
+            }
         hint = ""
         if len(images_b64) == 0:
             hint = (
@@ -1387,6 +1433,122 @@ async def _submit_comfyui_workflow(
                 + desc_reminder
             ),
         }
+
+
+def _get_client_id(config: Any) -> str:
+    return str(
+        _config_get(config, "client_id", "astrbot-comfyui-bubble-1")
+        or "astrbot-comfyui-bubble-1"
+    ).strip()
+
+
+async def _submit_comfyui_workflow_to_port(
+    port: Dict[str, Any],
+    workflow_name: str,
+    texts: List[str],
+    images_b64: List[str],
+    videos: List[str],
+) -> Dict[str, Any]:
+    workflow_name = (workflow_name or "").strip()
+    texts = [str(t) for t in (texts or []) if str(t).strip()]
+    images_b64 = [str(img) for img in (images_b64 or []) if str(img).strip()]
+    videos = [str(v).strip() for v in (videos or []) if str(v).strip()]
+    if not workflow_name:
+        return {"ok": False, "message": "缺少工作流名称。"}
+    if not isinstance(port, dict) or not port.get("name") or not port.get("http"):
+        return {"ok": False, "message": "接口配置不可用。"}
+
+    config = _plugin_config or {}
+    server_ip = str(port.get("http") or "").strip()
+    client_id = f"{_get_client_id(config)}-webui-{uuid.uuid4().hex[:8]}"
+    wf_dir = _get_workflow_dir()
+    workflow_params = _load_workflow_params()
+    all_workflows = list_workflows_in_dir(wf_dir, workflow_params)
+    workflows = _filter_workflows_for_port(all_workflows, port)
+    if any(w["name"] == workflow_name for w in all_workflows) and not any(w["name"] == workflow_name for w in workflows):
+        return {
+            "ok": False,
+            "message": f"接口「{port.get('name')}」不允许使用工作流「{workflow_name}」。",
+        }
+
+    workflow_file = find_workflow_file(
+        workflow_name, len(texts), len(images_b64), len(videos), wf_dir, workflow_params
+    )
+    if not workflow_file:
+        matching_names = [w for w in workflows if w["name"] == workflow_name]
+        if matching_names:
+            return {
+                "ok": False,
+                "message": _workflow_input_mismatch_message(
+                    workflow_name,
+                    matching_names,
+                    len(texts),
+                    len(images_b64),
+                    len(videos),
+                ),
+            }
+        return {
+            "ok": False,
+            "message": (
+                f"没有找到匹配的工作流「{workflow_name}」"
+                f"（当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}）。"
+            ),
+        }
+
+    info = _get_configured_workflow_info(wf_dir, Path(workflow_file).name, workflow_params)
+    if not info:
+        return {"ok": False, "message": "工作流配置不可用，请先在工作流管理页保存参数配置。"}
+    ok_inputs, texts, images_b64, videos, input_error = _apply_workflow_input_rules(
+        info, texts, images_b64, videos
+    )
+    if not ok_inputs:
+        return {
+            "ok": False,
+            "message": (
+                f"工作流「{workflow_name}」参数数量不匹配。"
+                f"当前提供：文本{len(texts)}，图片{len(images_b64)}，视频{len(videos)}。"
+                + (" " + input_error if input_error else "")
+            ),
+        }
+
+    try:
+        debug = bool(
+            getattr(config, "debug_mode", False)
+            if not isinstance(config, dict)
+            else config.get("debug_mode", False)
+        )
+        workflow = ComfyUIWorkflow(server_ip, client_id)
+        workflow.load_workflow_api(workflow_file)
+        prompt_id = await workflow.submit_only(images_b64, texts, videos, debug=debug)
+        output_rules = (info.get("params") or {}).get("outputs") or {}
+        return {
+            "ok": True,
+            "prompt_id": prompt_id,
+            "workflow_name": workflow_name,
+            "workflow_file": Path(workflow_file).name,
+            "port_name": str(port.get("name") or ""),
+            "server_ip": server_ip,
+            "client_id": client_id,
+            "output_rules": output_rules,
+        }
+    except httpx.HTTPStatusError as e:
+        body = ""
+        try:
+            if e.response is not None:
+                body = e.response.text
+        except Exception:
+            pass
+        summary = _parse_comfyui_400_summary(body)
+        return {
+            "ok": False,
+            "message": (
+                f"执行失败：ComfyUI 返回 {e.response.status_code if e.response else '?'}。"
+                + (summary if summary else (f"服务端信息：{body[:1500]}" if body else str(e)))
+            ),
+        }
+    except Exception as e:
+        logger.exception("webui comfyui debug submit failed")
+        return {"ok": False, "message": f"执行失败：{e}"}
 
 
 def _split_comfyui_command_args(msg: str) -> tuple[str, List[str]]:
@@ -1880,7 +2042,7 @@ class ComfyUIListWorkflowsTool(FunctionTool[AstrAgentContext]):
         wf_dir = _get_workflow_dir()
         workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(wf_dir), active_port)
         if not workflows:
-            return f"当前 ComfyUI 来源「{active_port['name']}」没有可用工作流。请使用 /comfyuiport 切换来源，或调整该来源的可用工作流配置。"
+            return f"当前 ComfyUI 接口「{active_port['name']}」没有可用工作流。请使用 /comfyui_port 切换接口，或调整该接口的可用工作流配置。"
         
         # 返回工作流名称和简短说明
         lines = [f"Current ComfyUI: {active_port['name']} ({server_ip})", "Available workflows:"]
@@ -2779,7 +2941,7 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
 @register(
     "comfyui_bubble",
     "Comfyui 泡泡版🫧",
-    "Comfyui 泡泡版：执行/查询工作流、WebSocket 等待、手动命令、多来源切换与工作流 WebUI 管理",
+    "Comfyui 泡泡版：执行/查询工作流、WebSocket 等待、手动命令、多接口切换与工作流 WebUI 管理",
     "1.0.3",
     "",
 )
@@ -2789,6 +2951,7 @@ class ComfyUIPlugin(Star):
         global _plugin_config, _plugin_context
         _plugin_config = self.config = config or {}
         _plugin_context = self.context
+        _sync_active_interface_config(self.config)
         self.context.add_llm_tools(
             ComfyUIListWorkflowsTool(),
             ComfyUIStatusTool(),
@@ -2796,6 +2959,544 @@ class ComfyUIPlugin(Star):
             ComfyUIExecuteTool(),
         )
         self._web_server = None  # ManagementServer 实例，在 initialize 中启动
+        self._webui_debug_tasks: Dict[str, Dict[str, Any]] = {}
+        self._webui_debug_order: List[str] = []
+        self._webui_debug_runners: Dict[str, asyncio.Task] = {}
+        self._webui_debug_watchers: Dict[str, asyncio.Task] = {}
+
+    def _serialize_webui_debug_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(task)
+        now = time.time()
+        if data.get("status") == "queued":
+            data["elapsed"] = 0
+        else:
+            started = float(data.get("started_at") or data.get("created_at") or now)
+            data["elapsed"] = max(0, round(float(data.get("finished_at") or now) - started, 1))
+        return data
+
+    def _serialize_webui_debug_history_summary(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        input_data = task.get("input") if isinstance(task.get("input"), dict) else {}
+        result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        return {
+            "task_id": task.get("task_id", ""),
+            "prompt_id": task.get("prompt_id", ""),
+            "status": task.get("status", ""),
+            "port_name": task.get("port_name", ""),
+            "workflow_name": task.get("workflow_name", ""),
+            "workflow_file": task.get("workflow_file", ""),
+            "created_at": task.get("created_at"),
+            "started_at": task.get("started_at"),
+            "finished_at": task.get("finished_at"),
+            "elapsed": task.get("elapsed", 0),
+            "thumbnail": task.get("thumbnail", ""),
+            "error": task.get("error", ""),
+            "input_summary": task.get("input_summary")
+            or {
+                "texts": len(input_data.get("texts") or []),
+                "images": len(input_data.get("images") or []),
+            },
+            "result_summary": {
+                "texts": len(result.get("texts") or []),
+                "images": len(result.get("images") or []),
+                "videos": len(result.get("videos") or []),
+                "audio": len(result.get("audio") or []),
+            },
+            "summary": True,
+        }
+
+    def _webui_debug_output_dir(self) -> Path:
+        path = PLUGIN_DATA_DIR / "webui" / "output"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _webui_debug_history_path(self, task_id: str) -> Path:
+        safe_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(task_id or ""))
+        return self._webui_debug_output_dir() / f"{safe_id}.json"
+
+    def _remember_webui_debug_task(self, task: Dict[str, Any]) -> None:
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            return
+        self._webui_debug_tasks[task_id] = task
+        if task_id in self._webui_debug_order:
+            self._webui_debug_order.remove(task_id)
+        self._webui_debug_order.append(task_id)
+
+    async def _save_webui_debug_thumbnail(self, task: Dict[str, Any]) -> None:
+        result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        images = result.get("images") if isinstance(result, dict) else []
+        if not images:
+            return
+        image_url = str(images[0] or "")
+        if not image_url:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(image_url)
+                resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "").lower()
+            suffix = ".jpg" if "jpeg" in content_type or "jpg" in content_type else ".png"
+            thumb_name = f"{task['task_id']}_thumb{suffix}"
+            thumb_path = self._webui_debug_output_dir() / thumb_name
+            thumb_path.write_bytes(resp.content)
+            task["thumbnail"] = f"/api/debug/output/{thumb_name}"
+        except Exception as e:
+            logger.warning("webui debug thumbnail save failed: %s", e)
+
+    async def _persist_webui_debug_task(self, task: Dict[str, Any]) -> None:
+        task["finished_at"] = task.get("finished_at") or time.time()
+        await self._save_webui_debug_thumbnail(task)
+        record = self._serialize_webui_debug_task(task)
+        record.pop("server_ip", None)
+        record.pop("client_id", None)
+        record.pop("output_rules", None)
+        record.pop("port_http", None)
+        record.pop("port_workflows", None)
+        record.pop("queue_key", None)
+        record.pop("texts_for_submit", None)
+        record.pop("images_for_submit", None)
+        record.pop("videos_for_submit", None)
+        self._webui_debug_history_path(str(task.get("task_id") or "")).write_text(
+            json.dumps(record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    async def _finish_webui_debug_task(self, task_id: str) -> None:
+        task = self._webui_debug_tasks.get(task_id)
+        if not task:
+            return
+        task["status"] = "running"
+        task["started_at"] = time.time()
+        timeout = _get_websocket_wait_timeout(self.config or {})
+        try:
+            port = {"name": task.get("port_name"), "http": task.get("port_http"), "workflows": task.get("port_workflows", [])}
+            submit = await _submit_comfyui_workflow_to_port(
+                port,
+                str(task.get("workflow_name") or ""),
+                list(task.get("texts_for_submit") or []),
+                list(task.get("images_for_submit") or []),
+                [],
+            )
+            if not submit.get("ok"):
+                task["status"] = "failed"
+                task["error"] = submit.get("message") or "提交失败。"
+                task["finished_at"] = time.time()
+                return
+            task["prompt_id"] = submit["prompt_id"]
+            task["workflow_file"] = submit.get("workflow_file") or task.get("workflow_file", "")
+            task["server_ip"] = submit["server_ip"]
+            task["client_id"] = submit["client_id"]
+            task["output_rules"] = submit.get("output_rules") or {}
+            wait_result = await _wait_for_comfyui_ws_completion(
+                task["server_ip"], task["client_id"], task["prompt_id"], timeout
+            )
+            status = wait_result.get("status")
+            if status != "completed":
+                history_state = await _get_prompt_history_state(task["server_ip"], task["prompt_id"])
+                if status == "ws_unavailable":
+                    deadline = time.time() + max(5, timeout)
+                    while not history_state.get("completed") and time.time() < deadline:
+                        await asyncio.sleep(2)
+                        history_state = await _get_prompt_history_state(task["server_ip"], task["prompt_id"])
+                if not history_state.get("completed"):
+                    task["status"] = "timeout" if status == "timeout" else "failed"
+                    task["error"] = wait_result.get("message") or history_state.get("message") or "ComfyUI 任务未完成。"
+                    task["finished_at"] = time.time()
+                    return
+
+            media, ftype, texts = await _get_result_for_prompt(
+                task["server_ip"], task["prompt_id"], task.get("output_rules")
+            )
+            if ftype == "error":
+                task["status"] = "failed"
+                task["error"] = "\n".join(texts) if texts else "ComfyUI 输出数量不匹配。"
+            else:
+                media = media if isinstance(media, dict) else {}
+                task["status"] = "completed"
+                task["result"] = {
+                    "type": ftype,
+                    "texts": texts or [],
+                    "images": media.get("images", []) if isinstance(media, dict) else [],
+                    "videos": media.get("videos", []) if isinstance(media, dict) else [],
+                    "audio": media.get("audio", []) if isinstance(media, dict) else [],
+                }
+            task["finished_at"] = time.time()
+        except Exception as e:
+            logger.exception("webui comfyui debug task failed")
+            task["status"] = "failed"
+            task["error"] = str(e)
+            task["finished_at"] = time.time()
+        finally:
+            if task.get("status") in {"completed", "failed", "timeout"}:
+                await self._persist_webui_debug_task(task)
+                self._webui_debug_tasks.pop(task_id, None)
+                if task_id in self._webui_debug_order:
+                    self._webui_debug_order.remove(task_id)
+
+    async def _run_webui_debug_queue(self, port_name: str) -> None:
+        try:
+            while True:
+                queued = [
+                    task
+                    for task in self._webui_debug_tasks.values()
+                    if task.get("port_name") == port_name and task.get("status") == "queued"
+                ]
+                if not queued:
+                    return
+                queued.sort(key=lambda item: float(item.get("created_at") or 0))
+                await self._finish_webui_debug_task(str(queued[0].get("task_id") or ""))
+        finally:
+            self._webui_debug_runners.pop(port_name, None)
+
+    def _ensure_webui_debug_runner(self, port_name: str) -> None:
+        runner = self._webui_debug_runners.get(port_name)
+        if runner and not runner.done():
+            return
+        self._webui_debug_runners[port_name] = asyncio.create_task(
+            self._run_webui_debug_queue(port_name)
+        )
+
+    def _webui_debug_queue_key(self, port_http: str) -> str:
+        return _get_comfyui_http_base(str(port_http or "")).rstrip("/")
+
+    def _webui_debug_unfinished_count(self, queue_key: str) -> int:
+        return sum(
+            1
+            for task in self._webui_debug_tasks.values()
+            if task.get("queue_key") == queue_key
+            and task.get("status") not in {"completed", "failed", "timeout"}
+        )
+
+    async def _get_webui_debug_queue_sets(self, server_ip: str) -> tuple[set[str], set[str], bool]:
+        base = _get_comfyui_http_base(server_ip)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{base}/queue")
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            logger.debug("webui debug queue sync failed for %s: %s", base, e)
+            return set(), set(), False
+
+        def _ids(items: Any) -> set[str]:
+            result: set[str] = set()
+            if not isinstance(items, list):
+                return result
+            for item in items:
+                if isinstance(item, (list, tuple)) and len(item) >= 2 and item[1]:
+                    result.add(str(item[1]))
+            return result
+
+        return _ids(data.get("queue_running")), _ids(data.get("queue_pending")), True
+
+    async def _persist_and_remove_webui_debug_task(self, task: Dict[str, Any]) -> None:
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            return
+        await self._persist_webui_debug_task(task)
+        self._webui_debug_tasks.pop(task_id, None)
+        if task_id in self._webui_debug_order:
+            self._webui_debug_order.remove(task_id)
+        watcher = self._webui_debug_watchers.pop(task_id, None)
+        current = asyncio.current_task()
+        if watcher and watcher is not current and not watcher.done():
+            watcher.cancel()
+
+    async def _complete_webui_debug_task_from_history(self, task: Dict[str, Any]) -> None:
+        media, ftype, texts = await _get_result_for_prompt(
+            str(task.get("server_ip") or ""),
+            str(task.get("prompt_id") or ""),
+            task.get("output_rules"),
+        )
+        if ftype == "error":
+            task["status"] = "failed"
+            task["error"] = "\n".join(texts) if texts else "ComfyUI 输出数量不匹配。"
+        else:
+            media = media if isinstance(media, dict) else {}
+            task["status"] = "completed"
+            task["result"] = {
+                "type": ftype,
+                "texts": texts or [],
+                "images": media.get("images", []) if isinstance(media, dict) else [],
+                "videos": media.get("videos", []) if isinstance(media, dict) else [],
+                "audio": media.get("audio", []) if isinstance(media, dict) else [],
+            }
+        task["finished_at"] = time.time()
+        await self._persist_and_remove_webui_debug_task(task)
+
+    async def _sync_webui_debug_task_states(self) -> None:
+        tasks = [
+            task
+            for task in self._webui_debug_tasks.values()
+            if task.get("status") not in {"completed", "failed", "timeout"}
+        ]
+        if not tasks:
+            return
+        by_server: Dict[str, List[Dict[str, Any]]] = {}
+        for task in tasks:
+            server_ip = str(task.get("server_ip") or task.get("port_http") or "")
+            if server_ip:
+                by_server.setdefault(self._webui_debug_queue_key(server_ip), []).append(task)
+
+        timeout = _get_websocket_wait_timeout(self.config or {})
+        now = time.time()
+        for grouped in by_server.values():
+            server_ip = str(grouped[0].get("server_ip") or grouped[0].get("port_http") or "")
+            running_ids, pending_ids, queue_ok = await self._get_webui_debug_queue_sets(server_ip)
+            for task in list(grouped):
+                task_id = str(task.get("task_id") or "")
+                prompt_id = str(task.get("prompt_id") or "")
+                if not prompt_id or task_id not in self._webui_debug_tasks:
+                    continue
+                if prompt_id in running_ids:
+                    task["status"] = "running"
+                    task["started_at"] = task.get("started_at") or now
+                    continue
+                if prompt_id in pending_ids:
+                    task["status"] = "queued"
+                    continue
+
+                history_state = await _get_prompt_history_state(server_ip, prompt_id)
+                if history_state.get("completed") or history_state.get("has_outputs"):
+                    await self._complete_webui_debug_task_from_history(task)
+                    continue
+                status_str = str(history_state.get("status_str") or "").lower()
+                if history_state.get("exists") and any(key in status_str for key in ("error", "failed", "interrupted")):
+                    task["status"] = "failed"
+                    task["error"] = history_state.get("message") or history_state.get("status_str")
+                    task["finished_at"] = now
+                    await self._persist_and_remove_webui_debug_task(task)
+                    continue
+                if queue_ok and now - float(task.get("created_at") or now) > max(5, timeout):
+                    task["status"] = "timeout"
+                    task["error"] = "ComfyUI 任务未在队列或历史记录中找到，已超时。"
+                    task["finished_at"] = now
+                    await self._persist_and_remove_webui_debug_task(task)
+                elif not queue_ok and now - float(task.get("created_at") or now) > max(5, timeout):
+                    task["status"] = "failed"
+                    task["error"] = "无法获取 ComfyUI 队列状态，任务已超时。"
+                    task["finished_at"] = now
+                    await self._persist_and_remove_webui_debug_task(task)
+
+    async def _watch_webui_debug_task(self, task_id: str) -> None:
+        try:
+            timeout = _get_websocket_wait_timeout(self.config or {})
+            while task_id in self._webui_debug_tasks:
+                task = self._webui_debug_tasks.get(task_id)
+                if not task:
+                    return
+                prompt_id = str(task.get("prompt_id") or "")
+                server_ip = str(task.get("server_ip") or "")
+                if not prompt_id or not server_ip:
+                    return
+                history_state = await _get_prompt_history_state(server_ip, prompt_id)
+                if history_state.get("completed") or history_state.get("has_outputs"):
+                    await self._complete_webui_debug_task_from_history(task)
+                    return
+                status_str = str(history_state.get("status_str") or "").lower()
+                if history_state.get("exists") and any(key in status_str for key in ("error", "failed", "interrupted")):
+                    task["status"] = "failed"
+                    task["error"] = history_state.get("message") or history_state.get("status_str")
+                    task["finished_at"] = time.time()
+                    await self._persist_and_remove_webui_debug_task(task)
+                    return
+                if time.time() - float(task.get("created_at") or time.time()) > max(5, timeout):
+                    running_ids, pending_ids, queue_ok = await self._get_webui_debug_queue_sets(server_ip)
+                    if queue_ok and prompt_id not in running_ids and prompt_id not in pending_ids:
+                        task["status"] = "timeout"
+                        task["error"] = "ComfyUI 任务未在队列或历史记录中找到，已超时。"
+                        task["finished_at"] = time.time()
+                        await self._persist_and_remove_webui_debug_task(task)
+                        return
+                    if not queue_ok:
+                        task["status"] = "failed"
+                        task["error"] = "无法获取 ComfyUI 队列状态，任务已超时。"
+                        task["finished_at"] = time.time()
+                        await self._persist_and_remove_webui_debug_task(task)
+                        return
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("webui comfyui debug watcher failed")
+            task = self._webui_debug_tasks.get(task_id)
+            if task:
+                task["status"] = "failed"
+                task["error"] = str(e)
+                task["finished_at"] = time.time()
+                await self._persist_and_remove_webui_debug_task(task)
+        finally:
+            current = asyncio.current_task()
+            watcher = self._webui_debug_watchers.get(task_id)
+            if watcher is current:
+                self._webui_debug_watchers.pop(task_id, None)
+
+    def _ensure_webui_debug_watcher(self, task_id: str) -> None:
+        watcher = self._webui_debug_watchers.get(task_id)
+        if watcher and not watcher.done():
+            return
+        self._webui_debug_watchers[task_id] = asyncio.create_task(
+            self._watch_webui_debug_task(task_id)
+        )
+
+    async def submit_webui_debug_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        port_name = str(payload.get("port_name") or payload.get("portName") or "").strip()
+        workflow_name = str(payload.get("workflow_name") or payload.get("workflowName") or "").strip()
+        texts = [str(t) for t in (payload.get("texts") or []) if str(t).strip()]
+        images = [str(img) for img in (payload.get("images") or []) if str(img).strip()]
+        videos = [str(v) for v in (payload.get("videos") or []) if str(v).strip()]
+        image_inputs = [
+            item
+            for item in (payload.get("image_inputs") or [])
+            if isinstance(item, dict) and item.get("data_url")
+        ]
+        video_inputs = [
+            item
+            for item in (payload.get("video_inputs") or [])
+            if isinstance(item, dict) and item.get("filename")
+        ]
+        ports = _get_comfyui_ports(self.config or {})
+        port = next((p for p in ports if str(p.get("name") or "") == port_name), None)
+        if not port:
+            return {"ok": False, "error": "接口不存在。"}
+
+        queue_key = self._webui_debug_queue_key(str(port.get("http") or ""))
+        if self._webui_debug_unfinished_count(queue_key) >= 10:
+            return {"ok": False, "error": "当前接口调试队列已满，最多允许 10 个未完成任务。"}
+
+        task_id = f"webui_{uuid.uuid4().hex}"
+        task = {
+            "task_id": task_id,
+            "prompt_id": "",
+            "status": "queued",
+            "port_name": port_name,
+            "port_http": str(port.get("http") or ""),
+            "port_workflows": list(port.get("workflows") or []),
+            "queue_key": queue_key,
+            "workflow_name": workflow_name,
+            "workflow_file": "",
+            "server_ip": "",
+            "client_id": "",
+            "output_rules": {},
+            "input_summary": {"texts": len(texts), "images": len(images), "videos": len(videos)},
+            "input": {
+                "port_name": port_name,
+                "workflow_name": workflow_name,
+                "texts": texts,
+                "images": image_inputs,
+                "videos": video_inputs,
+            },
+            "texts_for_submit": texts,
+            "images_for_submit": images,
+            "videos_for_submit": videos,
+            "created_at": time.time(),
+            "result": {"texts": [], "images": [], "videos": [], "audio": []},
+        }
+        submit = await _submit_comfyui_workflow_to_port(
+            port,
+            workflow_name,
+            texts,
+            images,
+            videos,
+        )
+        if not submit.get("ok"):
+            task["status"] = "failed"
+            task["error"] = submit.get("message") or "提交失败。"
+            task["finished_at"] = time.time()
+            await self._persist_webui_debug_task(task)
+            return {"ok": False, "error": task["error"], "task": self._serialize_webui_debug_task(task)}
+
+        task["prompt_id"] = submit["prompt_id"]
+        task["workflow_file"] = submit.get("workflow_file") or task.get("workflow_file", "")
+        task["server_ip"] = submit["server_ip"]
+        task["client_id"] = submit["client_id"]
+        task["output_rules"] = submit.get("output_rules") or {}
+        self._remember_webui_debug_task(task)
+        self._ensure_webui_debug_watcher(task_id)
+        return {"ok": True, "task": self._serialize_webui_debug_task(task)}
+
+    async def list_webui_debug_tasks(self) -> Dict[str, Any]:
+        await self._sync_webui_debug_task_states()
+        return {
+            "ok": True,
+            "tasks": [
+                self._serialize_webui_debug_task(self._webui_debug_tasks[task_id])
+                for task_id in self._webui_debug_order
+                if task_id in self._webui_debug_tasks
+            ],
+        }
+
+    async def list_webui_debug_history(self) -> Dict[str, Any]:
+        items: List[Dict[str, Any]] = []
+        paths = sorted(
+            self._webui_debug_output_dir().glob("*.json"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    items.append(self._serialize_webui_debug_history_summary(data))
+            except Exception:
+                continue
+            if len(items) >= 120:
+                break
+        return {"ok": True, "tasks": items}
+
+    async def get_webui_debug_task(self, task_id: str) -> Dict[str, Any]:
+        task = self._webui_debug_tasks.get(str(task_id or ""))
+        if not task:
+            path = self._webui_debug_history_path(str(task_id or ""))
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        return {"ok": True, "task": data}
+                except Exception:
+                    pass
+        if not task:
+            return {"ok": False, "error": "任务不存在。"}
+        return {"ok": True, "task": self._serialize_webui_debug_task(task)}
+
+    async def delete_webui_debug_task(self, task_id: str) -> Dict[str, Any]:
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            return {"ok": False, "error": "任务不存在。"}
+
+        task = self._webui_debug_tasks.pop(task_id, None)
+        if task_id in self._webui_debug_order:
+            self._webui_debug_order.remove(task_id)
+        watcher = self._webui_debug_watchers.pop(task_id, None)
+        if watcher and not watcher.done():
+            watcher.cancel()
+        if task:
+            return {"ok": True, "deleted": 1, "scope": "active"}
+
+        path = self._webui_debug_history_path(task_id)
+        if not path.exists() or not path.is_file():
+            return {"ok": False, "error": "任务不存在。"}
+
+        thumbnail = ""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                thumbnail = str(data.get("thumbnail") or "")
+        except Exception:
+            thumbnail = ""
+        if thumbnail.startswith("/api/debug/output/"):
+            thumb_name = Path(thumbnail.rsplit("/", 1)[-1]).name
+            thumb_path = self._webui_debug_output_dir() / thumb_name
+            if thumb_path.exists() and thumb_path.is_file():
+                try:
+                    thumb_path.unlink()
+                except Exception:
+                    pass
+        try:
+            path.unlink()
+        except Exception as e:
+            return {"ok": False, "error": f"删除任务失败：{e}"}
+        return {"ok": True, "deleted": 1, "scope": "history"}
 
     async def initialize(self) -> None:
         """插件加载完成后启动工作流管理页（若启用）。"""
@@ -2822,6 +3523,14 @@ class ComfyUIPlugin(Star):
                 active_port_state_path=ACTIVE_PORT_STATE_PATH,
                 load_ports_func=lambda: _get_comfyui_ports(self.config or {}),
                 save_ports_func=_save_ports_config_file,
+                active_port_changed_func=lambda: _sync_active_interface_config(
+                    self.config, persist=True
+                ),
+                debug_submit_func=self.submit_webui_debug_task,
+                debug_tasks_func=self.list_webui_debug_tasks,
+                debug_history_func=self.list_webui_debug_history,
+                debug_task_func=self.get_webui_debug_task,
+                debug_delete_func=self.delete_webui_debug_task,
             )
             await self._web_server.start(host, port)
             if host == "0.0.0.0":
@@ -3001,21 +3710,26 @@ class ComfyUIPlugin(Star):
                 except Exception:
                     pass
 
-    @filter.command("comfyuiport")
-    async def cmd_comfyuiport(self, event: AstrMessageEvent):
-        msg = _normalize_prefixed_command_text(event.message_str or "", "comfyuiport")
+    @filter.command("comfyui_port")
+    async def cmd_comfyui_port(self, event: AstrMessageEvent):
+        msg = _normalize_prefixed_command_text(event.message_str or "", "comfyui_port")
         config = self.config or {}
         ports = _get_comfyui_ports(config)
         active_port = _get_active_comfyui_port(config)
         if not msg:
-            lines = [f"当前 ComfyUI：{active_port['name']} ({active_port['http']})", "", "可用来源："]
+            if not ports:
+                yield event.plain_result(
+                    '当前没有可用 ComfyUI 接口。请去 Management page 添加接口。'
+                )
+                return
+            lines = [f"当前 ComfyUI 接口：{active_port['name']} ({active_port['http']})", "", "可用接口："]
             for port in ports:
                 marker = "*" if port["name"] == active_port["name"] else "-"
                 workflows = port.get("workflows") or []
                 workflow_text = "全部工作流" if not workflows else "、".join(workflows)
                 lines.append(f"{marker} {port['name']} ({port['http']})：{workflow_text}")
             lines.append("")
-            lines.append("使用 /comfyuiport <name> 切换来源。")
+            lines.append("使用 /comfyui_port <接口名称> 切换接口。")
             yield event.plain_result("\n".join(lines))
             return
 
@@ -3026,19 +3740,20 @@ class ComfyUIPlugin(Star):
                 break
         if not target:
             names = "、".join(port["name"] for port in ports) or "无"
-            yield event.plain_result(f"没有找到 ComfyUI 来源「{msg}」。可用来源：{names}")
+            yield event.plain_result(f"没有找到 ComfyUI 接口「{msg}」。可用接口：{names}")
             return
 
         try:
             _write_active_port_name(target["name"])
+            _sync_active_interface_config(self.config, persist=True)
         except Exception as e:
             logger.warning("ComfyUI write active port state failed: %s", e)
-            yield event.plain_result(f"切换失败：无法保存当前来源配置。{e}")
+            yield event.plain_result(f"切换失败：无法保存当前接口配置。{e}")
             return
 
         workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(_get_workflow_dir()), target)
         yield event.plain_result(
-            f"已切换 ComfyUI 来源：{target['name']} ({target['http']})\n"
+            f"已切换 ComfyUI 接口：{target['name']} ({target['http']})\n"
             f"当前可用工作流：{len(workflows)} 个"
         )
 
@@ -3052,7 +3767,7 @@ class ComfyUIPlugin(Star):
             workflows = _filter_workflows_for_port(_list_workflows_in_configured_dir(wf_dir), active_port)
             descriptions = await _load_workflow_descriptions(self.config)
             if not workflows:
-                yield event.plain_result(f"当前 ComfyUI 来源「{active_port['name']}」没有可用工作流。请使用 /comfyuiport 切换来源，或调整该来源的可用工作流配置。")
+                yield event.plain_result(f"当前 ComfyUI 接口「{active_port['name']}」没有可用工作流。请使用 /comfyui_port 切换接口，或调整该接口的可用工作流配置。")
                 return
             lines = []
             for idx, w in enumerate(workflows, start=1):

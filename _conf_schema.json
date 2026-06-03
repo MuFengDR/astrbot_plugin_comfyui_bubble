@@ -1,99 +1,71 @@
 {
   "client_id": {
-    "description": "ComfyUI client ID",
+    "description": "ComfyUI 客户端 ID",
     "type": "string",
-    "hint": "Used to identify this client in the ComfyUI queue and WebSocket events.",
+    "hint": "用于在 ComfyUI 队列和 WebSocket 事件中标识当前客户端。",
     "default": "astrbot-comfyui-bubble-1"
   },
-  "_ports_section": {
-    "description": "=== ComfyUI sources ===",
+  "_interface_section": {
+    "description": "=== ComfyUI 接口 ===",
     "type": "text",
     "invisible": true
   },
-  "comfyui_port_1_name": {
-    "description": "ComfyUI source 1 name",
+  "comfyui_active_interface_name": {
+    "description": "当前接口名称",
     "type": "string",
-    "hint": "This is the default source when /comfyuiport has not selected a source yet.",
-    "default": ""
+    "default": "",
+    "disabled": true,
+    "hint": "更改接口请去 Management page 进行设置，或对 bot 发送命令 \"/comfyui_port <接口名称>\" 更改接口"
   },
-  "comfyui_port_1_http": {
-    "description": "ComfyUI source 1 HTTP address",
+  "comfyui_active_interface_http": {
+    "description": "当前接口 HTTP 地址",
     "type": "string",
-    "hint": "Example: http://127.0.0.1:8188 or 127.0.0.1:8188",
-    "default": "127.0.0.1:8188"
-  },
-  "comfyui_port_2_name": {
-    "description": "ComfyUI source 2 name",
-    "type": "string",
-    "default": ""
-  },
-  "comfyui_port_2_http": {
-    "description": "ComfyUI source 2 HTTP address",
-    "type": "string",
-    "default": ""
-  },
-  "comfyui_port_3_name": {
-    "description": "ComfyUI source 3 name",
-    "type": "string",
-    "default": ""
-  },
-  "comfyui_port_3_http": {
-    "description": "ComfyUI source 3 HTTP address",
-    "type": "string",
-    "default": ""
-  },
-  "comfyui_port_4_name": {
-    "description": "ComfyUI source 4 name",
-    "type": "string",
-    "default": ""
-  },
-  "comfyui_port_4_http": {
-    "description": "ComfyUI source 4 HTTP address",
-    "type": "string",
-    "default": ""
+    "default": "",
+    "disabled": true,
+    "hint": "更改接口请去 Management page 进行设置，或对 bot 发送命令 \"/comfyui_port <接口名称>\" 更改接口"
   },
   "debug_mode": {
-    "description": "Debug mode",
+    "description": "调试模式",
     "type": "bool",
     "default": false,
-    "hint": "Print the workflow JSON sent to ComfyUI for troubleshooting text/image injection."
+    "hint": "打印发送到 ComfyUI 的工作流 JSON，便于排查文本、图片注入问题。"
   },
   "websocket_wait_timeout_seconds": {
-    "description": "ComfyUI WebSocket wait timeout (seconds)",
+    "description": "ComfyUI WebSocket 等待超时（秒）",
     "type": "int",
     "default": 900,
-    "hint": "Maximum time comfyui_query_wait waits for ComfyUI WebSocket completion events. Set 0 to only check completed history. Runtime clamps to 0-3600 seconds."
+    "hint": "comfyui_query_wait 等待 ComfyUI WebSocket 完成事件的最长时间。设为 0 时只检查已完成历史；运行时会限制在 0-3600 秒。"
   },
   "_history_section": {
-    "description": "=== History cleanup ===",
+    "description": "=== 历史清理 ===",
     "type": "text",
     "invisible": true
   },
   "auto_cleanup_hours": {
-    "description": "Auto cleanup history (hours)",
+    "description": "自动清理历史（小时）",
     "type": "int",
     "default": 48,
-    "hint": "History older than this value will be cleaned automatically. Set 0 to disable."
+    "hint": "自动清理超过该小时数的历史记录。设为 0 表示关闭自动清理。"
   },
   "_webui_section": {
-    "description": "=== Workflow management page ===",
+    "description": "=== 工作流管理页面 ===",
     "type": "text",
     "invisible": true
   },
   "webui_enabled": {
-    "description": "Enable workflow management page",
+    "description": "启用工作流管理页面",
     "type": "bool",
     "default": true,
-    "hint": "Enable uploading, listing, annotating, renaming, and deleting workflow JSON files in a browser."
+    "hint": "启用后可在浏览器中上传、查看、标注、重命名和删除工作流 JSON 文件。"
   },
   "webui_host": {
-    "description": "Management page listen host",
+    "description": "管理页面监听地址",
     "type": "string",
     "default": "127.0.0.1",
-    "hint": "Use 0.0.0.0 to allow LAN access; 127.0.0.1 is local only."
+    "hint": "使用 0.0.0.0 可允许局域网访问；127.0.0.1 仅允许本机访问。"
   },
   "webui_port": {
-    "description": "Management page listen port",
+    "description": "管理页面监听端口",
     "type": "int",
     "default": 6187
   }

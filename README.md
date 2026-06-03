@@ -2,7 +2,7 @@
 
 将 ComfyUI 工作流封装为 LLM 可调用的工具，也支持用户通过 `/comfyui` 命令直接执行工作流。**向 BOT 描述你的目的，或直接指定工作流和参数，最终将图片/视频/文本等产物发送给你。**
 
-> 本插件基于原插件 [cjxzdzh/astrbot_plugin_comfyui](https://github.com/cjxzdzh/astrbot_plugin_comfyui) 修改扩展，增加 WebSocket 事件等待、命令式执行、多 ComfyUI 来源切换、工作流白名单等能力，并修复了一些原插件使用中的问题。
+> 本插件基于原插件 [cjxzdzh/astrbot_plugin_comfyui](https://github.com/cjxzdzh/astrbot_plugin_comfyui) 修改扩展，增加 WebSocket 事件等待、命令式执行、多 ComfyUI 接口切换、工作流白名单等能力，并修复了一些原插件使用中的问题。
 
 ---
 
@@ -13,7 +13,7 @@
 - **文生视频**：用文字描述，生成视频
 - **图文改图**：发图 + 修改说明，让 BOT 按你的要求修改图片
 - **命令直连工作流**：不经过 LLM 改写，直接用 `/comfyui 工作流 参数` 提交任务
-- **多 ComfyUI 来源**：在多台 ComfyUI 机器之间切换，并为每个来源配置可用工作流
+- **多 ComfyUI 接口**：在多台 ComfyUI 机器之间切换，并为每个接口配置可用工作流
 
 ### 使用方式
 
@@ -105,13 +105,12 @@ LLM 自动调用时，BOT 会：
 ### 4.1 安装与配置
 
 - 将本插件目录放入 AstrBot 的 **`data/plugins/`**（或通过插件市场安装）。  
-- 在 AstrBot 配置中填写：
-  - **comfyui_port_1_name / comfyui_port_1_http**：默认 ComfyUI 来源名称与地址（如 `127.0.0.1:8188`）。
-  - 可继续配置 **comfyui_port_2 ~ comfyui_port_4**，用于多台 ComfyUI 机器切换。
+- 在 AstrBot 配置中查看/设置：
+  - **当前接口名称 / 当前接口 HTTP 地址**：仅用于只读展示，接口增删和切换请在 Management page 中完成，或发送 `/comfyui_port <接口名称>`。
   - **client_id**：ComfyUI 客户端 ID（可选，按需填写）。  
   - **websocket_wait_timeout_seconds**：等待 ComfyUI WebSocket 完成事件的最长时间，默认 900 秒。
 - 若需工作流管理页：启用 **webui_enabled**，配置 **webui_host** / **webui_port**（如 `http://127.0.0.1:6187`），重载插件后浏览器访问该地址。
-- 工作流管理页可以配置 4 个 ComfyUI 来源、HTTP 地址，以及每个来源允许使用的工作流白名单。白名单为空表示该来源允许全部工作流。
+- 工作流管理页可以动态添加 ComfyUI 接口、HTTP 地址，以及每个接口允许使用的工作流白名单。白名单为空表示该接口允许全部工作流。
 
 ### 4.2 上传工作流与参数配置
 
@@ -176,7 +175,7 @@ LLM 自动调用时，BOT 会：
 /comfyui upload
 ```
 
-- `/comfyui list`：列出当前 ComfyUI 来源允许使用的工作流。列表编号按当前过滤结果生成，可直接用编号执行。
+- `/comfyui list`：列出当前 ComfyUI 接口允许使用的工作流。列表编号按当前过滤结果生成，可直接用编号执行。
 - `/comfyui <工作流名称或编号> ...`：提交工作流并等待 WebSocket 完成事件，用户输入文本会原样进入 Simple String 节点。
 - 多段文本使用半角 `|` 或全角 `｜` 分隔；如果工作流只接收 1 段文本，剩余内容会作为一整段文本传入。
 - 图片可直接随命令发送，也支持引用 Telegram 图片消息；若适配器能解析引用原图，插件会把引用图片作为 `图片N` 输入。
@@ -190,21 +189,21 @@ LLM 自动调用时，BOT 会：
 /comfyui 图片编辑高清修复 图中角色做一个比心动作
 ```
 
-### 4.5 多 ComfyUI 来源与工作流白名单
+### 4.5 多 ComfyUI 接口与工作流白名单
 
-插件支持最多 4 个 ComfyUI 来源，适合同时接入高性能主机、低功耗主机、远程机器等场景。
+插件支持动态配置多个 ComfyUI 接口，适合同时接入高性能主机、低功耗主机、远程机器等场景。
 
-- 在工作流管理页的“ComfyUI 来源配置”中填写每个来源的名称和 HTTP 地址。
-- 每个来源可以勾选允许使用的工作流；未勾选的工作流不会出现在 `/comfyui list` 和 `comfyui_list_workflows` 中，也不能被执行。
-- 某个来源允许全部工作流时，可以开启“允许全部工作流”。
-- 使用 `/comfyuiport` 查看当前来源和可用来源。
-- 使用 `/comfyuiport <name>` 切换当前全局来源，切换结果会保存，重启后仍生效。
+- 在工作流管理页的“ComfyUI 接口配置”中添加接口，并填写接口名称和 HTTP 地址。
+- 每个接口可以勾选允许使用的工作流；未勾选的工作流不会出现在 `/comfyui list` 和 `comfyui_list_workflows` 中，也不能被执行。
+- 某个接口允许全部工作流时，可以开启“允许全部工作流”。
+- 使用 `/comfyui_port` 查看当前接口和可用接口。
+- 使用 `/comfyui_port <接口名称>` 切换当前全局接口，切换结果会保存，重启后仍生效。
 
 示例：
 
 ```text
-/comfyuiport
-/comfyuiport 高性能机
+/comfyui_port
+/comfyui_port 高性能机
 ```
 
 ### 4.6 WebSocket 等待机制
@@ -238,8 +237,8 @@ ws://<ComfyUI地址>/ws?clientId=<client_id>
 | **comfyui_query_wait** | 通过 WebSocket 等待任务完成；图片/视频由插件自动发送到会话 |
 | **comfyui_status** | 查询 ComfyUI 队列状态（运行中/等待中数量） |
 | **/comfyui** | 手动列出、上传、执行工作流，绕过 LLM prompt 改写 |
-| **/comfyuiport** | 查看/切换当前 ComfyUI 来源 |
-| **工作流管理页** | 上传/重命名/删除工作流 JSON，编辑说明，配置多来源与工作流白名单 |
+| **/comfyui_port** | 查看/切换当前 ComfyUI 接口 |
+| **工作流管理页** | 上传/重命名/删除工作流 JSON，编辑说明，配置多接口与工作流白名单 |
 
 ---
 
