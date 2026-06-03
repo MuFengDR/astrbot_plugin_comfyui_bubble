@@ -1,6 +1,6 @@
-name: astrbot_plugin_comfyui_pro
-display_name: ComfyUI Pro
+name: astrbot_plugin_comfyui_bubble
+display_name: Comfyui 泡泡版🫧
 description: 将 ComfyUI 工作流封装为 LLM 工具和 /comfyui 手动命令，支持 WebSocket 事件等待、工作流 WebUI 管理、多 ComfyUI 来源切换、输入输出参数配置和媒体自动发送。
-version: "1.0.2"
+version: "1.0.3"
 author: "MuFengDR"
 repo: "https://github.com/MuFengDR/astrbot_plugin_comfyui_pro"

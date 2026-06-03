@@ -3,7 +3,7 @@
     "description": "ComfyUI client ID",
     "type": "string",
     "hint": "Used to identify this client in the ComfyUI queue and WebSocket events.",
-    "default": "astrbot-comfyui-pro-1"
+    "default": "astrbot-comfyui-bubble-1"
   },
   "_ports_section": {
     "description": "=== ComfyUI sources ===",

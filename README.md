@@ -1,4 +1,4 @@
-# AstrBot ComfyUI Pro 工作流插件
+# AstrBot Comfyui 泡泡版🫧 工作流插件
 
 将 ComfyUI 工作流封装为 LLM 可调用的工具，也支持用户通过 `/comfyui` 命令直接执行工作流。**向 BOT 描述你的目的，或直接指定工作流和参数，最终将图片/视频/文本等产物发送给你。**
 
@@ -122,7 +122,7 @@ LLM 自动调用时，BOT 会：
 2. **上传、填写说明并配置参数**  
    - 打开本插件的**工作流管理页**（见 4.1），点击上传，选择重命名后的 `.json` 文件上传。  
    - 在管理页中为该工作流输入说明文字，并配置输入/输出的文本、图片、视频数量与强/弱校验模式。  
-   - 也可将 `.json` 直接放到 **`data/plugin_data/astrbot_plugin_comfyui_pro/workflows/`** 目录下，再在管理页中编辑说明。
+   - 也可将 `.json` 直接放到 **`data/plugin_data/astrbot_plugin_comfyui_bubble/workflows/`** 目录下，再在管理页中编辑说明。
 
 3. **参数配置规则（核心）**  
    工作流管理页中，每个工作流都可以配置输入和输出的 **文本 / 图片 / 视频**：
@@ -145,7 +145,7 @@ LLM 自动调用时，BOT 会：
    | `反推提示词.json` | 输入图片强 1、输出文本强 1 |
 
 4. **填写说明（推荐）**  
-   - 在工作流管理页为每个文件填写**说明**（或直接编辑 `data/plugin_data/astrbot_plugin_comfyui_pro/workflow_meta.json`）。  
+   - 在工作流管理页为每个文件填写**说明**（或直接编辑 `data/plugin_data/astrbot_plugin_comfyui_bubble/workflow_meta.json`）。  
    - 说明会通过 `/comfyui list` 和 `comfyui_list_workflows` 返回，便于用户复制工作流名，也便于 LLM 选择合适工作流。  
    - 建议把输入/输出要求直接写进说明里，例如需要几段文本、几张图片、输出什么内容等。LLM 工具不会再额外拼接自动生成的参数摘要。
    - `workflow_meta.json` 中仍会保存说明，例如：
@@ -221,11 +221,11 @@ ws://<ComfyUI地址>/ws?clientId=<client_id>
 
 ### 4.7 安全与目录
 
-- **本地图片路径**：`comfyui_execute` 的 `image_urls` 若传入本地路径，仅允许以下根目录之下：**插件数据目录**（`data/plugin_data/astrbot_plugin_comfyui_pro/`）、**`data/agent/comfyui/input/`**、**`data/temp/`**（平台/适配器存放用户上传图的临时目录，避免「图在 temp 不被认可」导致 images=0）。建议使用绝对路径。禁止 `../` 路径穿越。
+- **本地图片路径**：`comfyui_execute` 的 `image_urls` 若传入本地路径，仅允许以下根目录之下：**插件数据目录**（`data/plugin_data/astrbot_plugin_comfyui_bubble/`）、**`data/agent/comfyui/input/`**、**`data/temp/`**（平台/适配器存放用户上传图的临时目录，避免「图在 temp 不被认可」导致 images=0）。建议使用绝对路径。禁止 `../` 路径穿越。
 - **占位符与持久化路径**：发送 ComfyUI 生成的图片/视频时，插件会将其另存到 `data/agent/comfyui/input/`，并通过占位符或自动队列发送给用户。聊天内容中不会主动暴露本地图片/视频路径。
 - **清理本地缓存**：工作流管理页提供「清理本地缓存」按钮，可删除 `data/agent/comfyui/input/` 与插件 `tmp/` 下的文件，防止占用过多磁盘空间。  
 - **base64 不传入 LLM**：优先使用 URL 或本地路径；若图片来源工具返回占位符（如 `base64://ASTRBOT_PLUGIN_CACHE_PENDING`），请将占位符传入 `image_urls`，不要将原始 base64 填入工具参数，以免 base64 进入 LLM 上下文。插件侧已对相关日志脱敏。  
-- 插件数据目录：**`data/plugin_data/astrbot_plugin_comfyui_pro/`**，其中 **`workflows/`** 存放工作流 JSON，**`workflow_meta.json`** 存放说明与参数配置。
+- 插件数据目录：**`data/plugin_data/astrbot_plugin_comfyui_bubble/`**，其中 **`workflows/`** 存放工作流 JSON，**`workflow_meta.json`** 存放说明与参数配置。旧目录 `data/plugin_data/astrbot_plugin_comfyui_pro/` 不会自动迁移，请按需手动复制。
 
 ---
 
