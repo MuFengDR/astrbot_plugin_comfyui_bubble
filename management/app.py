@@ -10,6 +10,7 @@ from .context import ManagementContext
 from .debug import register_debug_routes
 from .interfaces import register_interface_routes
 from .maintenance import register_maintenance_routes
+from .audit import register_audit_routes
 from .ui import register_ui_routes
 from .workflows import register_workflow_routes
 
@@ -32,6 +33,12 @@ def create_app(
     debug_task_func: Callable[[str], object] | None = None,
     debug_delete_func: Callable[[str], object] | None = None,
     debug_stop_func: Callable[[str], object] | None = None,
+    audit_records_func: Callable[..., object] | None = None,
+    audit_stats_func: Callable[[], object] | None = None,
+    audit_get_settings_func: Callable[[], object] | None = None,
+    audit_save_settings_func: Callable[[dict[str, object]], object] | None = None,
+    audit_manual_func: Callable[[str, str, str], object] | None = None,
+    audit_retry_func: Callable[[str], object] | None = None,
 ) -> web.Application:
     app = web.Application()
     if plugin_data_dir is None:
@@ -54,6 +61,12 @@ def create_app(
         debug_task_func=debug_task_func,
         debug_delete_func=debug_delete_func,
         debug_stop_func=debug_stop_func,
+        audit_records_func=audit_records_func,
+        audit_stats_func=audit_stats_func,
+        audit_get_settings_func=audit_get_settings_func,
+        audit_save_settings_func=audit_save_settings_func,
+        audit_manual_func=audit_manual_func,
+        audit_retry_func=audit_retry_func,
         output_media_dir=plugin_data_dir.resolve().parent.parent / "agent" / "comfyui" / "input",
         tmp_dir=plugin_data_dir / "tmp",
         media_history_dir=plugin_data_dir / "media" / "history",
@@ -65,4 +78,5 @@ def create_app(
     register_maintenance_routes(app, ctx)
     register_interface_routes(app, ctx)
     register_debug_routes(app, ctx)
+    register_audit_routes(app, ctx)
     return app

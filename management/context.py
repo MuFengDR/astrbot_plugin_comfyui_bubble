@@ -25,6 +25,12 @@ class ManagementContext:
     debug_task_func: Callable[[str], object] | None = None
     debug_delete_func: Callable[[str], object] | None = None
     debug_stop_func: Callable[[str], object] | None = None
+    audit_records_func: Callable[..., object] | None = None
+    audit_stats_func: Callable[[], object] | None = None
+    audit_get_settings_func: Callable[[], object] | None = None
+    audit_save_settings_func: Callable[[dict[str, object]], object] | None = None
+    audit_manual_func: Callable[[str, str, str], object] | None = None
+    audit_retry_func: Callable[[str], object] | None = None
     output_media_dir: Path | None = None
     tmp_dir: Path | None = None
     media_history_dir: Path | None = None

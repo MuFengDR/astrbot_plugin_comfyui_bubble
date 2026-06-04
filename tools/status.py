@@ -42,6 +42,7 @@ class ComfyUIStatusTool(FunctionTool[AstrAgentContext]):
             remaining = await runtime._estimate_remaining_seconds(server_ip, pending["prompt_id"])
             if remaining == 0:
                 url, ftype, texts = await runtime._get_result_for_prompt(server_ip, pending["prompt_id"], output_rules)
+                texts = runtime._filter_generated_texts_for_delivery(texts)
                 for k in list(runtime._session_pending.keys()):
                     if runtime._session_pending.get(k) == pending:
                         runtime._session_pending.pop(k, None)
@@ -81,6 +82,7 @@ class ComfyUIStatusTool(FunctionTool[AstrAgentContext]):
                 url, ftype, texts = await runtime._wait_for_completion(
                     server_ip, client_id, pending["prompt_id"], timeout=remaining + 120, output_rules=output_rules
                 )
+                texts = runtime._filter_generated_texts_for_delivery(texts)
                 for k in list(runtime._session_pending.keys()):
                     if runtime._session_pending.get(k) == pending:
                         runtime._session_pending.pop(k, None)

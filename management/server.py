@@ -32,6 +32,12 @@ class ManagementServer:
         debug_task_func: Callable[[str], object] | None = None,
         debug_delete_func: Callable[[str], object] | None = None,
         debug_stop_func: Callable[[str], object] | None = None,
+        audit_records_func: Callable[..., object] | None = None,
+        audit_stats_func: Callable[[], object] | None = None,
+        audit_get_settings_func: Callable[[], object] | None = None,
+        audit_save_settings_func: Callable[[dict[str, object]], object] | None = None,
+        audit_manual_func: Callable[[str, str, str], object] | None = None,
+        audit_retry_func: Callable[[str], object] | None = None,
     ):
         if plugin_data_dir is None:
             plugin_data_dir = workflows_dir.parent
@@ -53,6 +59,12 @@ class ManagementServer:
             debug_task_func=debug_task_func,
             debug_delete_func=debug_delete_func,
             debug_stop_func=debug_stop_func,
+            audit_records_func=audit_records_func,
+            audit_stats_func=audit_stats_func,
+            audit_get_settings_func=audit_get_settings_func,
+            audit_save_settings_func=audit_save_settings_func,
+            audit_manual_func=audit_manual_func,
+            audit_retry_func=audit_retry_func,
         )
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None

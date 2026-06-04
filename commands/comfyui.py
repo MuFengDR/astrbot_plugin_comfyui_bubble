@@ -192,6 +192,14 @@ def _format_command_result(wait_result: Dict[str, Any]) -> str:
         texts = item.get("texts") or []
         text_body = "\n\n".join(str(t).strip() for t in texts if str(t).strip())
         prefix = f"完成{elapsed_text}："
+        if item.get("delivery") == "skipped_by_send_policy":
+            if text_body:
+                return f"{prefix}{text_body}\n\n内容已生成，但按发送策略未发送。"
+            return f"{prefix}内容已生成，但按发送策略未发送。"
+        if item.get("delivery") == "blocked_by_audit":
+            if text_body:
+                return f"{prefix}{text_body}\n\n图片已生成，但内容审核未通过，未发送。"
+            return f"{prefix}图片已生成，但内容审核未通过，未发送。"
         image_count = int(item.get("image_count", 0) or (1 if ftype == "image" else 0))
         video_count = int(item.get("video_count", 0) or (1 if ftype == "video" else 0))
         image_placeholders = runtime.COMFYUI_IMAGE_PLACEHOLDER * max(0, image_count)
