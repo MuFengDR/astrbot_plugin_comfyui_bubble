@@ -21,7 +21,8 @@ async def _download_url_to_local(url: str) -> str:
         import uuid
         from pathlib import Path
         # 使用 comfyui input 目录
-        local_dir = Path("/home/ubuntu/AstrBot/data/agent/comfyui/input")
+        plugin_dir = globals().get("PLUGIN_DATA_DIR")
+        local_dir = (Path(plugin_dir) / "media" / "history") if plugin_dir else Path("data/plugin_data/astrbot_plugin_comfyui_bubble/media/history")
         local_dir.mkdir(parents=True, exist_ok=True)
         # 生成唯一文件名
         ext = ".png"
@@ -129,6 +130,7 @@ _plugin_config: Any = None
 _plugin_config: Any = None
 # 插件 Context，供工具内调用 send_message 发送图片等
 _plugin_context: Any = None
+_task_service: Any = None
 
 
 def _ensure_workflows_dir() -> None:
@@ -506,10 +508,16 @@ def _get_session_key(context: Any) -> str:
         event = getattr(ctx, "event", None) if ctx else None
         if event is None and ctx is not None:
             event = getattr(getattr(ctx, "context", None), "event", None)
+        if event is None and hasattr(context, "unified_msg_origin"):
+            event = context
         if event is not None:
             umo = getattr(event, "unified_msg_origin", None) or ""
             if umo:
                 return umo
+            if hasattr(event, "get_session_id"):
+                sid = event.get_session_id()
+                if sid:
+                    return str(sid)
     except Exception:
         pass
     return "default"
@@ -542,6 +550,8 @@ def _get_session_id_from_context(context: Any) -> Optional[str]:
             extra = getattr(agent_ctx, "extra", None) or {}
             if isinstance(extra, dict):
                 event = extra.get("event")
+        if event is None and (hasattr(context, "get_session_id") or hasattr(context, "message_obj")):
+            event = context
         sid = _sid_from_event(event)
         if sid is not None:
             return sid
@@ -561,6 +571,13 @@ def _get_sender_id_from_context(context: Any) -> Optional[str]:
             extra = getattr(agent_ctx, "extra", None) or {}
             if isinstance(extra, dict):
                 event = extra.get("event")
+        if event is None and (
+            hasattr(context, "get_sender_id")
+            or hasattr(context, "user_id")
+            or hasattr(context, "sender")
+            or hasattr(context, "message_obj")
+        ):
+            event = context
         if event is None:
             return None
         # 尝试从 event 获取 sender 或 user_id
@@ -646,8 +663,8 @@ async def _download_image_to_temp(image_url: str) -> Optional[str]:
 
 
 def _get_comfyui_output_image_dir() -> Path:
-    """返回持久化图片保存目录（data/agent/comfyui/input），与 image_urls 允许的本地路径一致，便于 Bot 从消息 content 中拿到路径后再传回 comfyui_execute。"""
-    p = PLUGIN_DATA_DIR.resolve().parent.parent / "agent" / "comfyui" / "input"
+    """返回生成结果的本地历史媒体目录，便于 Bot/WebUI 复用输出文件。"""
+    p = PLUGIN_DATA_DIR / "media" / "history"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -830,6 +847,30 @@ async def _send_video_to_session(session_id: str, video_path: str) -> bool:
                 Path(video_path).unlink(missing_ok=True)
             except Exception:
                 pass
+
+
+async def _send_plain_to_session(session_id: str, text: str) -> bool:
+    if not session_id or not str(text or "").strip():
+        return False
+    ctx = _plugin_context
+    if not ctx:
+        return False
+    try:
+        from astrbot.api.message_components import Plain
+        try:
+            from astrbot.api.event import MessageEventResult
+        except ImportError:
+            from astrbot.core.message.message_event_result import MessageEventResult
+        chain = [Plain(str(text).strip())]
+        try:
+            result = MessageEventResult(chain=chain)
+        except TypeError:
+            result = MessageEventResult().chain_result(chain)
+        await ctx.send_message(session_id, result)
+        return True
+    except Exception as e:
+        logger.warning("ComfyUI send plain text to session failed: %s", e)
+        return False
 
 
 async def _get_queue_status(server_ip: str) -> tuple:
@@ -1183,6 +1224,18 @@ async def _append_completed_task_result(
     texts: List[str],
 ) -> None:
     if ftype == "error":
+        if _task_service:
+            try:
+                await _task_service.complete_external_task(
+                    prompt_id,
+                    task_server_ip,
+                    url,
+                    ftype,
+                    texts,
+                    "\n".join(texts) if texts else "ComfyUI 输出错误。",
+                )
+            except Exception as e:
+                logger.warning("ComfyUI task center complete failed: %s", e)
         results.append(
             {
                 "task_id": prompt_id,
@@ -1192,6 +1245,11 @@ async def _append_completed_task_result(
             }
         )
         return
+    if _task_service:
+        try:
+            await _task_service.complete_external_task(prompt_id, task_server_ip, url, ftype, texts)
+        except Exception as e:
+            logger.warning("ComfyUI task center complete failed: %s", e)
     if isinstance(url, dict):
         images = [str(u) for u in (url.get("images") or []) if u]
         videos = [str(u) for u in (url.get("videos") or []) if u]
@@ -1275,6 +1333,7 @@ async def _submit_comfyui_workflow(
     image_urls_arg: List[str],
     session_tag: str,
     event: Optional[Any] = None,
+    origin: str = "command",
 ) -> Dict[str, Any]:
     workflow_name = (workflow_name or "").strip()
     texts = [str(t) for t in (texts or []) if str(t).strip()]
@@ -1387,6 +1446,8 @@ async def _submit_comfyui_workflow(
             "session_key": session_key,
             "session_tag": session_tag,
             "output_rules": output_rules,
+            "workflow_name": workflow_name,
+            "workflow_file": wf_filename,
         }
         _session_pending[session_key] = pending_data
         if session_key != "default":
@@ -1396,10 +1457,24 @@ async def _submit_comfyui_workflow(
             _session_tag_tasks[session_tag] = []
         if prompt_id not in _session_tag_tasks[session_tag]:
             _session_tag_tasks[session_tag].append(prompt_id)
+        if _task_service:
+            try:
+                _task_service.remember_external_task(
+                    origin,
+                    {**pending_data, "workflow_file": wf_filename},
+                    workflow_name,
+                    texts=texts,
+                    images=images_b64,
+                    videos=videos,
+                    session_tag=session_tag,
+                )
+            except Exception as e:
+                logger.warning("ComfyUI task center register failed: %s", e)
         return {
             "ok": True,
             "prompt_id": prompt_id,
             "workflow_name": workflow_name,
+            "workflow_file": wf_filename,
             "server_ip": server_ip,
             "client_id": client_id,
             "session_key": session_key,
@@ -2367,6 +2442,17 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
             task_client_id = pending.get("client_id") or client_id_cfg
             output_rules = pending.get("output_rules")
 
+            if pending.get("status") == "canceled":
+                _cleanup_completed_task(prompt_id, task_session_tag)
+                results.append(
+                    {
+                        "task_id": prompt_id,
+                        "status": "canceled",
+                        "message": pending.get("message") or "ComfyUI task was manually stopped from WebUI.",
+                    }
+                )
+                continue
+
             if not prompt_id or not task_server_ip:
                 results.append({"task_id": task_id, "status": "error", "message": "invalid task data"})
                 continue
@@ -2516,12 +2602,15 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
 
         completed_tasks = []
         pending_count = 0
+        canceled_count = 0
         for r in results:
             if isinstance(r, dict):
                 if r.get("status") == "completed" and r.get("type") == "image" and r.get("url", "").startswith("http"):
                     completed_tasks.append(r)
                 elif r.get("status") == "pending":
                     pending_count += 1
+                elif r.get("status") == "canceled":
+                    canceled_count += 1
 
         for task in completed_tasks:
             url = task.get("url", "")
@@ -2535,8 +2624,9 @@ class ComfyUIQueryWaitTool(FunctionTool[AstrAgentContext]):
             "results": results,
             "summary": {
                 "total": len(results),
-                "completed": len(results) - pending_count,
+                "completed": sum(1 for r in results if isinstance(r, dict) and r.get("status") == "completed"),
                 "pending": pending_count,
+                "canceled": canceled_count,
             },
         }
         if pending_count > 0:
@@ -2888,6 +2978,8 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
                 "session_key": session_key,
                 "session_tag": session_tag,
                 "output_rules": output_rules,
+                "workflow_name": workflow_name,
+                "workflow_file": wf_filename,
             }
             _session_pending[session_key] = pending_data
             if session_key != "default":
@@ -2899,6 +2991,19 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
                 _session_tag_tasks[session_tag] = []
             if prompt_id not in _session_tag_tasks[session_tag]:
                 _session_tag_tasks[session_tag].append(prompt_id)
+            if _task_service:
+                try:
+                    _task_service.remember_external_task(
+                        "llm_tool",
+                        pending_data,
+                        workflow_name,
+                        texts=texts,
+                        images=images_b64,
+                        videos=videos,
+                        session_tag=session_tag,
+                    )
+                except Exception as e:
+                    logger.warning("ComfyUI task center register failed: %s", e)
             
             # 获取该 session_tag 下所有任务 UUID
             all_uuids = _session_tag_tasks.get(session_tag, [])
@@ -2948,9 +3053,10 @@ class ComfyUIExecuteTool(FunctionTool[AstrAgentContext]):
 class ComfyUIPlugin(Star):
     def __init__(self, context: Context, config: Any = None):
         super().__init__(context)
-        global _plugin_config, _plugin_context
+        global _plugin_config, _plugin_context, _task_service
         _plugin_config = self.config = config or {}
         _plugin_context = self.context
+        _task_service = self
         _sync_active_interface_config(self.config)
         self.context.add_llm_tools(
             ComfyUIListWorkflowsTool(),
@@ -2963,6 +3069,76 @@ class ComfyUIPlugin(Star):
         self._webui_debug_order: List[str] = []
         self._webui_debug_runners: Dict[str, asyncio.Task] = {}
         self._webui_debug_watchers: Dict[str, asyncio.Task] = {}
+
+    def _media_history_dir(self) -> Path:
+        path = PLUGIN_DATA_DIR / "media" / "history"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _media_history_url(self, filename: str) -> str:
+        return f"/api/media/history/{Path(filename).name}"
+
+    def _safe_task_filename(self, value: str) -> str:
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(value or "task"))
+        return safe[:96] or "task"
+
+    async def _download_history_media(self, url: str, task_id: str, kind: str, index: int) -> Optional[Dict[str, Any]]:
+        if not url or not str(url).startswith(("http://", "https://")):
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.get(str(url))
+                resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "").lower()
+            suffix = ".mp4" if kind == "video" else ".png"
+            if "jpeg" in content_type or "jpg" in content_type:
+                suffix = ".jpg"
+            elif "webp" in content_type:
+                suffix = ".webp"
+            elif "gif" in content_type:
+                suffix = ".gif"
+            elif "webm" in content_type:
+                suffix = ".webm"
+            elif "quicktime" in content_type:
+                suffix = ".mov"
+            name = f"{self._safe_task_filename(task_id)}_{kind}_{index}{suffix}"
+            path = self._media_history_dir() / name
+            async with aiofiles.open(path, "wb") as f:
+                await f.write(resp.content)
+            return {
+                "url": self._media_history_url(name),
+                "original_url": str(url),
+                "filename": name,
+                "type": kind,
+                "size": len(resp.content or b""),
+            }
+        except Exception as e:
+            logger.warning("ComfyUI history media download failed: %s", e)
+            return None
+
+    async def _localize_task_result_media(self, task: Dict[str, Any]) -> None:
+        result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        media_files: List[Dict[str, Any]] = list(task.get("media_files") or [])
+        for key, kind in (("images", "image"), ("videos", "video")):
+            values = [str(u) for u in (result.get(key) or []) if u]
+            localized: List[str] = []
+            local_meta: List[Dict[str, Any]] = []
+            for idx, url in enumerate(values, 1):
+                if url.startswith("/api/media/history/"):
+                    localized.append(url)
+                    continue
+                item = await self._download_history_media(url, str(task.get("task_id") or task.get("prompt_id") or "task"), kind, idx)
+                if item:
+                    localized.append(item["url"])
+                    local_meta.append(item)
+                    media_files.append(item)
+                else:
+                    localized.append(url)
+            result[key] = localized
+            result[f"{key}_original"] = values
+            result[f"{key}_local"] = local_meta
+        task["result"] = result
+        task["media_files"] = media_files
 
     def _serialize_webui_debug_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(task)
@@ -2980,6 +3156,9 @@ class ComfyUIPlugin(Star):
         return {
             "task_id": task.get("task_id", ""),
             "prompt_id": task.get("prompt_id", ""),
+            "origin": task.get("origin", "webui"),
+            "origin_label": task.get("origin_label", ""),
+            "session_label": task.get("session_label", ""),
             "status": task.get("status", ""),
             "port_name": task.get("port_name", ""),
             "workflow_name": task.get("workflow_name", ""),
@@ -2989,6 +3168,7 @@ class ComfyUIPlugin(Star):
             "finished_at": task.get("finished_at"),
             "elapsed": task.get("elapsed", 0),
             "thumbnail": task.get("thumbnail", ""),
+            "media_files": task.get("media_files", []),
             "error": task.get("error", ""),
             "input_summary": task.get("input_summary")
             or {
@@ -3005,7 +3185,7 @@ class ComfyUIPlugin(Star):
         }
 
     def _webui_debug_output_dir(self) -> Path:
-        path = PLUGIN_DATA_DIR / "webui" / "output"
+        path = PLUGIN_DATA_DIR / "media" / "history"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -3017,10 +3197,118 @@ class ComfyUIPlugin(Star):
         task_id = str(task.get("task_id") or "")
         if not task_id:
             return
+        task.setdefault("origin", "webui")
+        task.setdefault("origin_label", {"webui": "WebUI", "command": "command", "llm_tool": "LLM 工具"}.get(str(task.get("origin")), str(task.get("origin") or "")))
         self._webui_debug_tasks[task_id] = task
         if task_id in self._webui_debug_order:
             self._webui_debug_order.remove(task_id)
         self._webui_debug_order.append(task_id)
+
+    def _session_label(self, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw or raw.lower() in {"default", "unknown", "none", "null"}:
+            return ""
+        return raw
+
+    def remember_external_task(
+        self,
+        origin: str,
+        submit: Dict[str, Any],
+        workflow_name: str,
+        texts: Optional[List[str]] = None,
+        images: Optional[List[str]] = None,
+        videos: Optional[List[str]] = None,
+        session_tag: str = "",
+    ) -> None:
+        prompt_id = str(submit.get("prompt_id") or "")
+        if not prompt_id:
+            return
+        task_id = prompt_id
+        port_name = ""
+        port_http = str(submit.get("server_ip") or "")
+        try:
+            active = _get_active_comfyui_port(self.config or {})
+            port_name = str(active.get("name") or "")
+            port_http = str(active.get("http") or port_http)
+        except Exception:
+            pass
+        task = self._webui_debug_tasks.get(task_id) or {}
+        task.update(
+            {
+                "task_id": task_id,
+                "prompt_id": prompt_id,
+                "origin": origin,
+                "origin_label": {"command": "command", "llm_tool": "LLM 工具", "webui": "WebUI"}.get(origin, origin),
+                "session_label": self._session_label(str(submit.get("session_key") or "") or session_tag or str(submit.get("session_tag") or "")),
+                "session_key": str(submit.get("session_key") or ""),
+                "session_tag": session_tag or str(submit.get("session_tag") or ""),
+                "status": task.get("status") or "queued",
+                "port_name": port_name,
+                "port_http": port_http,
+                "workflow_name": workflow_name,
+                "workflow_file": submit.get("workflow_file") or task.get("workflow_file", ""),
+                "server_ip": submit.get("server_ip") or port_http,
+                "client_id": submit.get("client_id") or "",
+                "output_rules": submit.get("output_rules") or {},
+                "queue_key": self._webui_debug_queue_key(port_http),
+                "input_summary": {"texts": len(texts or []), "images": len(images or []), "videos": len(videos or [])},
+                "input": {
+                    "port_name": port_name,
+                    "workflow_name": workflow_name,
+                    "texts": list(texts or []),
+                    "images": [],
+                    "videos": [{"name": Path(v).name, "filename": Path(v).name, "size": 0} for v in (videos or [])],
+                },
+                "created_at": task.get("created_at") or time.time(),
+                "result": task.get("result") or {"texts": [], "images": [], "videos": [], "audio": []},
+            }
+        )
+        self._remember_webui_debug_task(task)
+        self._ensure_webui_debug_watcher(task_id)
+
+    async def complete_external_task(
+        self,
+        prompt_id: str,
+        server_ip: str,
+        url: Any,
+        ftype: str,
+        texts: List[str],
+        error: str = "",
+    ) -> None:
+        task = self._webui_debug_tasks.get(str(prompt_id))
+        if not task:
+            if self._webui_debug_history_path(str(prompt_id)).exists():
+                return
+            task = {
+                "task_id": str(prompt_id),
+                "prompt_id": str(prompt_id),
+                "origin": "unknown",
+                "origin_label": "外部任务",
+                "status": "completed",
+                "port_name": "",
+                "workflow_name": "",
+                "server_ip": server_ip,
+                "created_at": time.time(),
+            }
+            self._remember_webui_debug_task(task)
+        if error or ftype == "error":
+            task["status"] = "failed"
+            task["error"] = error or ("\n".join(texts) if texts else "ComfyUI 输出错误。")
+        else:
+            media = url if isinstance(url, dict) else {}
+            images = media.get("images", []) if isinstance(media, dict) else ([url] if ftype == "image" and url else [])
+            videos = media.get("videos", []) if isinstance(media, dict) else ([url] if ftype == "video" and url else [])
+            audio = media.get("audio", []) if isinstance(media, dict) else []
+            task["status"] = "completed"
+            task["result"] = {
+                "type": ftype,
+                "texts": texts or [],
+                "images": images,
+                "videos": videos,
+                "audio": audio,
+            }
+        task["finished_at"] = time.time()
+        await self._persist_and_remove_webui_debug_task(task)
 
     async def _save_webui_debug_thumbnail(self, task: Dict[str, Any]) -> None:
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
@@ -3031,20 +3319,30 @@ class ComfyUIPlugin(Star):
         if not image_url:
             return
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(image_url)
-                resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "").lower()
-            suffix = ".jpg" if "jpeg" in content_type or "jpg" in content_type else ".png"
+            if image_url.startswith("/api/media/history/"):
+                filename = Path(image_url.rsplit("/", 1)[-1]).name
+                source = self._media_history_dir() / filename
+                if not source.exists() or not source.is_file():
+                    return
+                data = source.read_bytes()
+                suffix = source.suffix or ".png"
+            else:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.get(image_url)
+                    resp.raise_for_status()
+                content_type = resp.headers.get("content-type", "").lower()
+                suffix = ".jpg" if "jpeg" in content_type or "jpg" in content_type else ".png"
+                data = resp.content
             thumb_name = f"{task['task_id']}_thumb{suffix}"
             thumb_path = self._webui_debug_output_dir() / thumb_name
-            thumb_path.write_bytes(resp.content)
+            thumb_path.write_bytes(data)
             task["thumbnail"] = f"/api/debug/output/{thumb_name}"
         except Exception as e:
             logger.warning("webui debug thumbnail save failed: %s", e)
 
     async def _persist_webui_debug_task(self, task: Dict[str, Any]) -> None:
         task["finished_at"] = task.get("finished_at") or time.time()
+        await self._localize_task_result_media(task)
         await self._save_webui_debug_thumbnail(task)
         record = self._serialize_webui_debug_task(task)
         record.pop("server_ip", None)
@@ -3164,7 +3462,7 @@ class ComfyUIPlugin(Star):
             1
             for task in self._webui_debug_tasks.values()
             if task.get("queue_key") == queue_key
-            and task.get("status") not in {"completed", "failed", "timeout"}
+            and task.get("status") not in {"completed", "failed", "timeout", "canceled"}
         )
 
     async def _get_webui_debug_queue_sets(self, server_ip: str) -> tuple[set[str], set[str], bool]:
@@ -3188,6 +3486,70 @@ class ComfyUIPlugin(Star):
             return result
 
         return _ids(data.get("queue_running")), _ids(data.get("queue_pending")), True
+
+    async def _stop_comfyui_prompt(self, task: Dict[str, Any]) -> tuple[bool, str]:
+        prompt_id = str(task.get("prompt_id") or "")
+        server_ip = str(task.get("server_ip") or task.get("port_http") or "")
+        if not prompt_id or not server_ip:
+            return False, "任务缺少 ComfyUI prompt 信息。"
+        base = _get_comfyui_http_base(server_ip)
+        running_ids, pending_ids, queue_ok = await self._get_webui_debug_queue_sets(server_ip)
+        if not queue_ok:
+            return False, "无法获取 ComfyUI 队列状态，停止失败。"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                if prompt_id in pending_ids:
+                    resp = await client.post(f"{base}/queue", json={"delete": [prompt_id]})
+                    resp.raise_for_status()
+                    return True, "queued"
+                if prompt_id in running_ids:
+                    try:
+                        resp = await client.post(f"{base}/interrupt", json={"prompt_id": prompt_id})
+                        resp.raise_for_status()
+                        return True, "running"
+                    except Exception:
+                        if len(running_ids) == 1 and prompt_id in running_ids:
+                            resp = await client.post(f"{base}/interrupt", json={})
+                            resp.raise_for_status()
+                            return True, "running"
+                        raise
+        except Exception as e:
+            return False, f"停止 ComfyUI 任务失败：{e}"
+
+        history_state = await _get_prompt_history_state(server_ip, prompt_id)
+        if history_state.get("completed") or history_state.get("has_outputs"):
+            return False, "任务已经完成，无法停止。"
+        return True, "missing"
+
+    async def _after_manual_stop_feedback(self, task: Dict[str, Any]) -> None:
+        prompt_id = str(task.get("prompt_id") or "")
+        origin = str(task.get("origin") or "")
+        session_key = str(task.get("session_key") or task.get("session_label") or "")
+        session_tag = str(task.get("session_tag") or "")
+        if origin == "command":
+            if session_key:
+                await _send_plain_to_session(session_key, "ComfyUI 任务已被手动停止。")
+            _cleanup_completed_task(prompt_id, session_tag)
+        elif origin == "llm_tool":
+            pending = dict(_task_registry.get(prompt_id) or {})
+            pending.update(
+                {
+                    "prompt_id": prompt_id,
+                    "server_ip": task.get("server_ip") or pending.get("server_ip", ""),
+                    "client_id": task.get("client_id") or pending.get("client_id", ""),
+                    "session_key": session_key or pending.get("session_key", ""),
+                    "session_tag": session_tag or pending.get("session_tag", ""),
+                    "status": "canceled",
+                    "message": "ComfyUI task was manually stopped from WebUI.",
+                }
+            )
+            _task_registry[prompt_id] = pending
+            if pending.get("session_tag"):
+                tasks = _session_tag_tasks.setdefault(str(pending["session_tag"]), [])
+                if prompt_id not in tasks:
+                    tasks.append(prompt_id)
+        else:
+            _cleanup_completed_task(prompt_id, session_tag)
 
     async def _persist_and_remove_webui_debug_task(self, task: Dict[str, Any]) -> None:
         task_id = str(task.get("task_id") or "")
@@ -3228,7 +3590,7 @@ class ComfyUIPlugin(Star):
         tasks = [
             task
             for task in self._webui_debug_tasks.values()
-            if task.get("status") not in {"completed", "failed", "timeout"}
+            if task.get("status") not in {"completed", "failed", "timeout", "canceled"}
         ]
         if not tasks:
             return
@@ -3368,6 +3730,9 @@ class ComfyUIPlugin(Star):
         task = {
             "task_id": task_id,
             "prompt_id": "",
+            "origin": "webui",
+            "origin_label": "WebUI",
+            "session_label": "WebUI",
             "status": "queued",
             "port_name": port_name,
             "port_http": str(port.get("http") or ""),
@@ -3415,18 +3780,21 @@ class ComfyUIPlugin(Star):
         self._ensure_webui_debug_watcher(task_id)
         return {"ok": True, "task": self._serialize_webui_debug_task(task)}
 
-    async def list_webui_debug_tasks(self) -> Dict[str, Any]:
+    async def list_webui_debug_tasks(self, origin: str = "") -> Dict[str, Any]:
         await self._sync_webui_debug_task_states()
+        origin = str(origin or "").strip()
         return {
             "ok": True,
             "tasks": [
                 self._serialize_webui_debug_task(self._webui_debug_tasks[task_id])
                 for task_id in self._webui_debug_order
                 if task_id in self._webui_debug_tasks
+                and (not origin or str(self._webui_debug_tasks[task_id].get("origin") or "") == origin)
             ],
         }
 
-    async def list_webui_debug_history(self) -> Dict[str, Any]:
+    async def list_webui_debug_history(self, origin: str = "") -> Dict[str, Any]:
+        origin = str(origin or "").strip()
         items: List[Dict[str, Any]] = []
         paths = sorted(
             self._webui_debug_output_dir().glob("*.json"),
@@ -3437,6 +3805,8 @@ class ComfyUIPlugin(Star):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
+                    if origin and str(data.get("origin") or "webui") != origin:
+                        continue
                     items.append(self._serialize_webui_debug_history_summary(data))
             except Exception:
                 continue
@@ -3478,10 +3848,12 @@ class ComfyUIPlugin(Star):
             return {"ok": False, "error": "任务不存在。"}
 
         thumbnail = ""
+        media_files: List[Dict[str, Any]] = []
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 thumbnail = str(data.get("thumbnail") or "")
+                media_files = [item for item in (data.get("media_files") or []) if isinstance(item, dict)]
         except Exception:
             thumbnail = ""
         if thumbnail.startswith("/api/debug/output/"):
@@ -3492,11 +3864,76 @@ class ComfyUIPlugin(Star):
                     thumb_path.unlink()
                 except Exception:
                     pass
+        for item in media_files:
+            filename = Path(str(item.get("filename") or item.get("url", "").rsplit("/", 1)[-1])).name
+            if not filename:
+                continue
+            media_path = self._media_history_dir() / filename
+            if media_path.exists() and media_path.is_file():
+                try:
+                    media_path.unlink()
+                except Exception:
+                    pass
         try:
             path.unlink()
         except Exception as e:
             return {"ok": False, "error": f"删除任务失败：{e}"}
         return {"ok": True, "deleted": 1, "scope": "history"}
+
+    async def stop_webui_debug_task(self, task_id: str) -> Dict[str, Any]:
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            return {"ok": False, "error": "任务不存在。"}
+        task = self._webui_debug_tasks.get(task_id)
+        if not task:
+            return {"ok": False, "error": "任务不存在或已经结束。"}
+        if str(task.get("status") or "") not in {"queued", "running"}:
+            return {"ok": False, "error": "只有排队中或运行中的任务可以停止。"}
+
+        ok, scope_or_error = await self._stop_comfyui_prompt(task)
+        if not ok:
+            return {"ok": False, "error": scope_or_error}
+
+        task["status"] = "canceled"
+        task["error"] = "任务已被 WebUI 手动停止。"
+        task["finished_at"] = time.time()
+        await self._after_manual_stop_feedback(task)
+        await self._persist_and_remove_webui_debug_task(task)
+        return {"ok": True, "stopped": 1, "scope": scope_or_error, "task": self._serialize_webui_debug_task(task)}
+
+    def cleanup_task_history(self, hours: int = 48) -> int:
+        try:
+            hours = int(hours)
+        except Exception:
+            hours = 48
+        cutoff = 0 if hours <= 0 else time.time() - hours * 3600
+        deleted = 0
+        for path in list(self._webui_debug_output_dir().glob("*.json")):
+            try:
+                if cutoff and path.stat().st_mtime >= cutoff:
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+                thumbnail = str(data.get("thumbnail") or "") if isinstance(data, dict) else ""
+                media_files = data.get("media_files") if isinstance(data, dict) else []
+                if thumbnail.startswith("/api/debug/output/"):
+                    thumb_name = Path(thumbnail.rsplit("/", 1)[-1]).name
+                    thumb_path = self._webui_debug_output_dir() / thumb_name
+                    if thumb_path.exists() and thumb_path.is_file():
+                        thumb_path.unlink()
+                for item in media_files or []:
+                    if not isinstance(item, dict):
+                        continue
+                    filename = Path(str(item.get("filename") or item.get("url", "").rsplit("/", 1)[-1])).name
+                    if not filename:
+                        continue
+                    media_path = self._media_history_dir() / filename
+                    if media_path.exists() and media_path.is_file():
+                        media_path.unlink()
+                path.unlink()
+                deleted += 1
+            except Exception as e:
+                logger.warning("ComfyUI cleanup task history failed for %s: %s", path, e)
+        return deleted
 
     async def initialize(self) -> None:
         """插件加载完成后启动工作流管理页（若启用）。"""
@@ -3519,6 +3956,7 @@ class ComfyUIPlugin(Star):
                 load_meta=_load_workflow_meta,
                 save_meta=_save_workflow_meta,
                 plugin_data_dir=PLUGIN_DATA_DIR,
+                cleanup_history_func=self.cleanup_task_history,
                 ports_config_path=PORTS_CONFIG_PATH,
                 active_port_state_path=ACTIVE_PORT_STATE_PATH,
                 load_ports_func=lambda: _get_comfyui_ports(self.config or {}),
@@ -3531,6 +3969,7 @@ class ComfyUIPlugin(Star):
                 debug_history_func=self.list_webui_debug_history,
                 debug_task_func=self.get_webui_debug_task,
                 debug_delete_func=self.delete_webui_debug_task,
+                debug_stop_func=self.stop_webui_debug_task,
             )
             await self._web_server.start(host, port)
             if host == "0.0.0.0":
@@ -3841,6 +4280,7 @@ class ComfyUIPlugin(Star):
             image_urls,
             session_tag,
             event,
+            origin="command",
         )
         if not submit.get("ok"):
             yield event.plain_result(submit.get("message", "执行失败。"))
