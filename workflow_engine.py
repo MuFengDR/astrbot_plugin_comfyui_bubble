@@ -24,6 +24,7 @@ ASTR_BUBBLE_OUTPUT_NODES = {
     "AstrBubble_TextOutput": ("text", None),
     "AstrBubble_ImageOutput": ("image", None),
     "AstrBubble_VideoOutput": ("video", None),
+    "AstrBubble_VideoCombine": ("video", None),
 }
 ASTR_BUBBLE_NODE_CLASSES = set(ASTR_BUBBLE_INPUT_NODES) | set(ASTR_BUBBLE_OUTPUT_NODES)
 SLOT_KIND_LABELS = {"text": "文本", "image": "图片", "video": "视频"}
