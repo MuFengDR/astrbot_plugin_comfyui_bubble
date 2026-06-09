@@ -610,6 +610,24 @@ def _build_text_delivery_report(texts: List[str], audit_records: List[Dict[str, 
     }
 
 
+def _build_text_policy_delivery(texts: List[str]) -> tuple[List[str], Dict[str, Any]]:
+    raw_texts = [str(text) for text in (texts or []) if str(text or "").strip()]
+    if not raw_texts:
+        return [], {}
+    method = _resolve_send_method("text", "audit_disabled")
+    queued = method != "dont_send"
+    records = [
+        {
+            "audit_state": "audit_disabled",
+            "send_method": method,
+            "text_index": index,
+            "text_preview": text if len(text) <= 160 else text[:160] + "...",
+        }
+        for index, text in enumerate(raw_texts, 1)
+    ]
+    return (raw_texts if queued else []), _build_text_delivery_report(raw_texts, records)
+
+
 async def _audit_texts_for_delivery(prompt_id: str, texts: List[str]) -> tuple[List[str], Dict[str, Any]]:
     raw_texts = [str(text) for text in (texts or []) if str(text or "").strip()]
     if not raw_texts:
@@ -629,7 +647,7 @@ async def _audit_texts_for_delivery(prompt_id: str, texts: List[str]) -> tuple[L
                 return allowed_texts, _build_text_delivery_report(raw_texts, records)
         except Exception as e:
             logger.warning("ComfyUI text audit failed: %s", e)
-    return _filter_generated_texts_for_delivery(raw_texts), {}
+    return _build_text_policy_delivery(raw_texts)
 
 
 def _llm_media_delivery_message(media_label: str = "Media") -> str:
@@ -668,12 +686,6 @@ def _llm_media_delivery_message_from_report(
         "Reply with normal text only; the plugin will attach/send media automatically."
     )
 
-
-
-def _filter_generated_texts_for_delivery(texts: List[str]) -> List[str]:
-    if _resolve_send_method("text", "audit_disabled") == "dont_send":
-        return []
-    return texts
 
 
 async def _prepare_image_delivery_for_send(item: Any, session_key: str) -> tuple[Optional[str], Optional[str]]:

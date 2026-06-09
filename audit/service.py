@@ -61,10 +61,12 @@ class ContentAuditService:
         image = fallback if fallback in IMAGE_PROVIDERS else DEFAULT_IMAGE_PROVIDER
         text = DEFAULT_TEXT_PROVIDER
         if isinstance(value, dict):
-            candidate = str(value.get("image") or image).strip()
-            image = candidate if candidate in IMAGE_PROVIDERS else DEFAULT_IMAGE_PROVIDER
-            text_candidate = str(value.get("text") or text).strip()
-            text = text_candidate if text_candidate in TEXT_PROVIDERS else DEFAULT_TEXT_PROVIDER
+            if "image" in value:
+                candidate = str(value.get("image") or "").strip()
+                image = candidate if candidate in IMAGE_PROVIDERS or candidate == "" else DEFAULT_IMAGE_PROVIDER
+            if "text" in value:
+                text_candidate = str(value.get("text") or "").strip()
+                text = text_candidate if text_candidate in TEXT_PROVIDERS or text_candidate == "" else DEFAULT_TEXT_PROVIDER
         return {"image": image, "video": "", "text": text}
 
     def _normalize_baidu_settings(self, value: Any, current: Dict[str, Any] | None = None) -> Dict[str, str]:
@@ -156,7 +158,8 @@ class ContentAuditService:
         return self._public_settings(current)
 
     def _image_provider_for_settings(self, settings: Dict[str, Any]) -> Any:
-        provider_name = str((settings.get("providers") or {}).get("image") or settings.get("provider") or DEFAULT_IMAGE_PROVIDER)
+        providers = settings.get("providers") if isinstance(settings.get("providers"), dict) else {}
+        provider_name = str(providers.get("image") if "image" in providers else settings.get("provider") or DEFAULT_IMAGE_PROVIDER)
         if provider_name == "baidu_icr":
             baidu = settings.get("baidu_icr") if isinstance(settings.get("baidu_icr"), dict) else {}
             return BaiduImageAuditProvider(
@@ -164,10 +167,11 @@ class ContentAuditService:
                 api_key=str(baidu.get("api_key") or ""),
                 secret_key=str(baidu.get("secret_key") or ""),
             )
-        return BaiduImageAuditProvider(self.plugin_data_dir)
+        return None
 
     def _text_provider_for_settings(self, settings: Dict[str, Any]) -> Any:
-        provider_name = str((settings.get("providers") or {}).get("text") or DEFAULT_TEXT_PROVIDER)
+        providers = settings.get("providers") if isinstance(settings.get("providers"), dict) else {}
+        provider_name = str(providers.get("text") if "text" in providers else DEFAULT_TEXT_PROVIDER)
         if provider_name == "baidu_text_censor":
             text_baidu = settings.get("baidu_text_censor") if isinstance(settings.get("baidu_text_censor"), dict) else {}
             if str(text_baidu.get("credential_mode") or "reuse_image") == "separate":
@@ -179,7 +183,7 @@ class ContentAuditService:
                 api_key=str(baidu.get("api_key") or ""),
                 secret_key=str(baidu.get("secret_key") or ""),
             )
-        return BaiduTextAuditProvider(self.plugin_data_dir)
+        return None
 
     def _settings_with_payload(self, payload: Dict[str, Any] | None) -> Dict[str, Any]:
         current = self.load_settings()
@@ -220,9 +224,10 @@ class ContentAuditService:
         scope = str((payload or {}).get("test_scope") or "all").strip().lower() if isinstance(payload, dict) else "all"
         if scope not in {"all", "image", "text"}:
             scope = "all"
-        provider_name = str((settings.get("providers") or {}).get("image") or settings.get("provider") or DEFAULT_IMAGE_PROVIDER)
+        providers = settings.get("providers") if isinstance(settings.get("providers"), dict) else {}
+        provider_name = str(providers.get("image") if "image" in providers else settings.get("provider") or DEFAULT_IMAGE_PROVIDER)
         provider = self._image_provider_for_settings(settings)
-        text_provider_name = str((settings.get("providers") or {}).get("text") or DEFAULT_TEXT_PROVIDER)
+        text_provider_name = str(providers.get("text") if "text" in providers else DEFAULT_TEXT_PROVIDER)
         text_provider = self._text_provider_for_settings(settings)
         self._ensure_dir()
         test_path = self.audit_dir / "baidu_icr_test.png"
@@ -234,21 +239,30 @@ class ContentAuditService:
             if scope in {"all", "image"} and image_configured:
                 test_path.write_bytes(base64.b64decode(TEST_IMAGE_PNG))
                 result = await provider.audit_image(str(test_path), {"test": True})
+            elif scope in {"all", "image"} and not provider_name:
+                result = {"status": "skipped", "reason": "图片审核未配置，将跳过图片审核。"}
             elif scope in {"all", "image"}:
                 result = {"status": "skipped", "reason": "图片审核器未配置。"}
             if scope in {"all", "text"} and text_configured:
                 text_result = await text_provider.audit_text("测试文本", {"test": True})
+            elif scope in {"all", "text"} and not text_provider_name:
+                text_result = {"status": "skipped", "reason": "文本审核未配置，将跳过文本审核。"}
             elif scope in {"all", "text"}:
                 text_result = {"status": "skipped", "reason": "文本审核器未配置。"}
             image_required = scope in {"all", "image"}
             text_required = scope in {"all", "text"}
             status = normalize_status(result.get("status")) if image_required and image_configured else "pass"
             text_status = normalize_status(text_result.get("status")) if text_required and text_configured else "pass"
-            image_ready = not image_required or image_configured
-            text_ready = not text_required or text_configured
+            image_ready = not image_required or image_configured or not provider_name
+            text_ready = not text_required or text_configured or not text_provider_name
             ok = image_ready and text_ready and status in {"pass", "block"} and text_status in {"pass", "block"}
             if ok:
-                message = "百度图片审核连接成功。" if scope == "image" else "百度文本审核连接成功。" if scope == "text" else "百度内容审核连接成功。"
+                if scope == "image" and not provider_name:
+                    message = "图片审核未配置，将跳过图片审核。"
+                elif scope == "text" and not text_provider_name:
+                    message = "文本审核未配置，将跳过文本审核。"
+                else:
+                    message = "百度图片审核连接成功。" if scope == "image" else "百度文本审核连接成功。" if scope == "text" else "百度内容审核连接成功。"
             else:
                 message = str(result.get("reason") or text_result.get("reason") or "百度内容审核测试失败。")
             response = {
@@ -331,7 +345,11 @@ class ContentAuditService:
         settings = self.load_settings()
         if not settings.get("enabled", True):
             return {"allowed_images": list(images), "blocked": [], "records": []}
+        if not (settings.get("providers") or {}).get("image"):
+            return {"allowed_images": list(images), "blocked": [], "records": []}
         image_provider = self._image_provider_for_settings(settings)
+        if not image_provider:
+            return {"allowed_images": list(images), "blocked": [], "records": []}
 
         records = self._read_records()
         allowed: List[str] = []
@@ -399,7 +417,11 @@ class ContentAuditService:
         settings = self.load_settings()
         if not settings.get("enabled", True):
             return {"allowed_texts": list(texts or []), "blocked": [], "records": []}
+        if not (settings.get("providers") or {}).get("text"):
+            return {"allowed_texts": list(texts or []), "blocked": [], "records": []}
         text_provider = self._text_provider_for_settings(settings)
+        if not text_provider:
+            return {"allowed_texts": list(texts or []), "blocked": [], "records": []}
 
         records = self._read_records()
         allowed: List[str] = []
