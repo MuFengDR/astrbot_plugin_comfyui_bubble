@@ -36,7 +36,18 @@ def register_audit_routes(app: web.Application, ctx: ManagementContext) -> None:
     async def audit_settings_handler(request: web.Request) -> web.Response:
         if request.method == "GET":
             if not audit_get_settings_func:
-                return web.json_response({"ok": True, "settings": {"enabled": True, "provider": "baidu_icr", "providers": {"image": "baidu_icr", "video": "", "text": ""}, "fail_policy": "allow"}})
+                return web.json_response(
+                    {
+                        "ok": True,
+                        "settings": {
+                            "enabled": True,
+                            "provider": "baidu_icr",
+                            "providers": {"image": "baidu_icr", "video": "", "text": "baidu_text_censor"},
+                            "baidu_text_censor": {"credential_mode": "reuse_image", "configured": False},
+                            "fail_policy": "allow",
+                        },
+                    }
+                )
             result = await _maybe_await(audit_get_settings_func())
             return web.json_response(result if isinstance(result, dict) else {"ok": True, "settings": {}})
         if not audit_save_settings_func:

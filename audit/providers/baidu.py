@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Baidu Cloud ICR image audit provider."""
+"""Baidu Cloud ICR image/text audit providers."""
 
 from __future__ import annotations
 
@@ -138,3 +138,42 @@ class BaiduImageAuditProvider(AuditProvider):
             ) as resp:
                 data = await resp.json(content_type=None)
         return self._map_result(data if isinstance(data, dict) else {})
+
+
+class BaiduTextAuditProvider(BaiduImageAuditProvider):
+    name = "baidu_text_censor"
+    text_audit_url = "https://aip.baidubce.com/rest/2.0/solution/v1/text_censor/v2/user_defined"
+
+    async def audit_text(self, text: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.configured():
+            return {
+                "status": "error",
+                "categories": [],
+                "scores": {},
+                "reason": "百度文本审核未配置 API Key 或 Secret Key。",
+                "provider": self.name,
+                "raw": {},
+            }
+        content = str(text or "").strip()
+        if not content:
+            return {
+                "status": "pass",
+                "categories": [],
+                "scores": {},
+                "reason": "空文本无需审核。",
+                "provider": self.name,
+                "raw": {},
+            }
+        token = await self._get_access_token()
+        url = f"{self.text_audit_url}?access_token={quote(token)}"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                data={"text": content},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+        result = self._map_result(data if isinstance(data, dict) else {})
+        result["provider"] = self.name
+        return result

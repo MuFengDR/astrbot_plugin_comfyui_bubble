@@ -20,11 +20,14 @@ from .models import (
     now_ts,
     public_record,
 )
-from .providers.baidu import BaiduImageAuditProvider
+from .providers.baidu import BaiduImageAuditProvider, BaiduTextAuditProvider
 
 
 DEFAULT_IMAGE_PROVIDER = "baidu_icr"
+DEFAULT_TEXT_PROVIDER = "baidu_text_censor"
 IMAGE_PROVIDERS = {DEFAULT_IMAGE_PROVIDER}
+TEXT_PROVIDERS = {DEFAULT_TEXT_PROVIDER}
+TEXT_CREDENTIAL_MODES = {"reuse_image", "separate"}
 TEST_IMAGE_PNG = (
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAfUlEQVR4nNXOMREAIADEsFL/"
     "dn9HBAPXKMjZRpnESZzESZzESZzESZzESZzESZzESZzESZzESZzESZzESZzESZzESZzE"
@@ -47,18 +50,22 @@ class ContentAuditService:
         return {
             "enabled": True,
             "provider": DEFAULT_IMAGE_PROVIDER,
-            "providers": {"image": DEFAULT_IMAGE_PROVIDER, "video": "", "text": ""},
+            "providers": {"image": DEFAULT_IMAGE_PROVIDER, "video": "", "text": DEFAULT_TEXT_PROVIDER},
             "baidu_icr": {"api_key": "", "secret_key": ""},
+            "baidu_text_censor": {"credential_mode": "reuse_image", "api_key": "", "secret_key": ""},
             "fail_policy": "allow",
             "send_policy": default_send_policy(),
         }
 
     def _normalize_providers(self, value: Any, fallback: str = "") -> Dict[str, str]:
         image = fallback if fallback in IMAGE_PROVIDERS else DEFAULT_IMAGE_PROVIDER
+        text = DEFAULT_TEXT_PROVIDER
         if isinstance(value, dict):
             candidate = str(value.get("image") or image).strip()
             image = candidate if candidate in IMAGE_PROVIDERS else DEFAULT_IMAGE_PROVIDER
-        return {"image": image, "video": "", "text": ""}
+            text_candidate = str(value.get("text") or text).strip()
+            text = text_candidate if text_candidate in TEXT_PROVIDERS else DEFAULT_TEXT_PROVIDER
+        return {"image": image, "video": "", "text": text}
 
     def _normalize_baidu_settings(self, value: Any, current: Dict[str, Any] | None = None) -> Dict[str, str]:
         current = current or {}
@@ -68,6 +75,16 @@ class ContentAuditService:
         secret_key = secret_value if secret_value and secret_value != "********" else str(current.get("secret_key") or "").strip()
         return {"api_key": api_key, "secret_key": secret_key}
 
+    def _normalize_text_baidu_settings(self, value: Any, current: Dict[str, Any] | None = None) -> Dict[str, str]:
+        current = current or {}
+        data = value if isinstance(value, dict) else {}
+        mode = str(data.get("credential_mode") or current.get("credential_mode") or "reuse_image").strip()
+        if mode not in TEXT_CREDENTIAL_MODES:
+            mode = "reuse_image"
+        baidu = self._normalize_baidu_settings(data, current)
+        baidu["credential_mode"] = mode
+        return baidu
+
     def _public_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(settings)
         raw_baidu = settings.get("baidu_icr") if isinstance(settings.get("baidu_icr"), dict) else {}
@@ -75,6 +92,14 @@ class ContentAuditService:
         baidu["secret_key"] = "********" if raw_baidu.get("secret_key") else ""
         baidu["configured"] = bool(raw_baidu.get("api_key") and raw_baidu.get("secret_key"))
         data["baidu_icr"] = baidu
+        raw_text = settings.get("baidu_text_censor") if isinstance(settings.get("baidu_text_censor"), dict) else {}
+        text_baidu = dict(raw_text)
+        text_baidu["credential_mode"] = str(raw_text.get("credential_mode") or "reuse_image")
+        text_baidu["secret_key"] = "********" if raw_text.get("secret_key") else ""
+        separate_configured = bool(raw_text.get("api_key") and raw_text.get("secret_key"))
+        text_baidu["configured"] = baidu["configured"] if text_baidu["credential_mode"] == "reuse_image" else separate_configured
+        text_baidu["separate_configured"] = separate_configured
+        data["baidu_text_censor"] = text_baidu
         return data
 
     def load_settings(self) -> Dict[str, Any]:
@@ -91,6 +116,7 @@ class ContentAuditService:
         settings["providers"] = self._normalize_providers(settings.get("providers"), legacy_provider)
         settings["provider"] = settings["providers"]["image"]
         settings["baidu_icr"] = self._normalize_baidu_settings(settings.get("baidu_icr"))
+        settings["baidu_text_censor"] = self._normalize_text_baidu_settings(settings.get("baidu_text_censor"))
         settings["fail_policy"] = normalize_fail_policy(settings.get("fail_policy"), "allow")
         settings["send_policy"] = normalize_send_policy(settings.get("send_policy"))
         return settings
@@ -116,6 +142,11 @@ class ContentAuditService:
                     payload.get("baidu_icr"),
                     current.get("baidu_icr") or {},
                 )
+            if "baidu_text_censor" in payload:
+                current["baidu_text_censor"] = self._normalize_text_baidu_settings(
+                    payload.get("baidu_text_censor"),
+                    current.get("baidu_text_censor") or {},
+                )
             if "send_policy" in payload:
                 current["send_policy"] = normalize_send_policy(payload.get("send_policy"))
             current["providers"] = self._normalize_providers(current.get("providers"), current.get("provider", ""))
@@ -135,6 +166,21 @@ class ContentAuditService:
             )
         return BaiduImageAuditProvider(self.plugin_data_dir)
 
+    def _text_provider_for_settings(self, settings: Dict[str, Any]) -> Any:
+        provider_name = str((settings.get("providers") or {}).get("text") or DEFAULT_TEXT_PROVIDER)
+        if provider_name == "baidu_text_censor":
+            text_baidu = settings.get("baidu_text_censor") if isinstance(settings.get("baidu_text_censor"), dict) else {}
+            if str(text_baidu.get("credential_mode") or "reuse_image") == "separate":
+                baidu = text_baidu
+            else:
+                baidu = settings.get("baidu_icr") if isinstance(settings.get("baidu_icr"), dict) else {}
+            return BaiduTextAuditProvider(
+                self.plugin_data_dir,
+                api_key=str(baidu.get("api_key") or ""),
+                secret_key=str(baidu.get("secret_key") or ""),
+            )
+        return BaiduTextAuditProvider(self.plugin_data_dir)
+
     def _settings_with_payload(self, payload: Dict[str, Any] | None) -> Dict[str, Any]:
         current = self.load_settings()
         if not isinstance(payload, dict):
@@ -153,30 +199,66 @@ class ContentAuditService:
                 payload.get("baidu_icr"),
                 current.get("baidu_icr") or {},
             )
+        if "baidu_text_censor" in payload:
+            merged["baidu_text_censor"] = self._normalize_text_baidu_settings(
+                payload.get("baidu_text_censor"),
+                current.get("baidu_text_censor") or {},
+            )
         merged["providers"] = self._normalize_providers(merged.get("providers"), merged.get("provider", ""))
         merged["provider"] = merged["providers"]["image"]
         merged["baidu_icr"] = self._normalize_baidu_settings(merged.get("baidu_icr"), current.get("baidu_icr") or {})
+        merged["baidu_text_censor"] = self._normalize_text_baidu_settings(
+            merged.get("baidu_text_censor"),
+            current.get("baidu_text_censor") or {},
+        )
         merged["fail_policy"] = normalize_fail_policy(merged.get("fail_policy"), "allow")
         merged["send_policy"] = normalize_send_policy(merged.get("send_policy"))
         return merged
 
     async def test_image_provider(self, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
         settings = self._settings_with_payload(payload)
+        scope = str((payload or {}).get("test_scope") or "all").strip().lower() if isinstance(payload, dict) else "all"
+        if scope not in {"all", "image", "text"}:
+            scope = "all"
         provider_name = str((settings.get("providers") or {}).get("image") or settings.get("provider") or DEFAULT_IMAGE_PROVIDER)
         provider = self._image_provider_for_settings(settings)
+        text_provider_name = str((settings.get("providers") or {}).get("text") or DEFAULT_TEXT_PROVIDER)
+        text_provider = self._text_provider_for_settings(settings)
         self._ensure_dir()
         test_path = self.audit_dir / "baidu_icr_test.png"
+        result: Dict[str, Any] = {}
+        text_result: Dict[str, Any] = {}
         try:
-            test_path.write_bytes(base64.b64decode(TEST_IMAGE_PNG))
-            result = await provider.audit_image(str(test_path), {"test": True})
-            status = normalize_status(result.get("status"))
-            ok = status in {"pass", "block"}
-            message = "百度内容审核连接成功。" if ok else str(result.get("reason") or "百度内容审核测试失败。")
+            image_configured = bool(getattr(provider, "configured", lambda: False)())
+            text_configured = bool(getattr(text_provider, "configured", lambda: False)())
+            if scope in {"all", "image"} and image_configured:
+                test_path.write_bytes(base64.b64decode(TEST_IMAGE_PNG))
+                result = await provider.audit_image(str(test_path), {"test": True})
+            elif scope in {"all", "image"}:
+                result = {"status": "skipped", "reason": "图片审核器未配置。"}
+            if scope in {"all", "text"} and text_configured:
+                text_result = await text_provider.audit_text("测试文本", {"test": True})
+            elif scope in {"all", "text"}:
+                text_result = {"status": "skipped", "reason": "文本审核器未配置。"}
+            image_required = scope in {"all", "image"}
+            text_required = scope in {"all", "text"}
+            status = normalize_status(result.get("status")) if image_required and image_configured else "pass"
+            text_status = normalize_status(text_result.get("status")) if text_required and text_configured else "pass"
+            image_ready = not image_required or image_configured
+            text_ready = not text_required or text_configured
+            ok = image_ready and text_ready and status in {"pass", "block"} and text_status in {"pass", "block"}
+            if ok:
+                message = "百度图片审核连接成功。" if scope == "image" else "百度文本审核连接成功。" if scope == "text" else "百度内容审核连接成功。"
+            else:
+                message = str(result.get("reason") or text_result.get("reason") or "百度内容审核测试失败。")
             response = {
                 "ok": ok,
+                "test_scope": scope,
                 "provider": getattr(provider, "name", provider_name),
+                "text_provider": getattr(text_provider, "name", text_provider_name),
                 "message": message,
                 "result": result,
+                "text_result": text_result,
             }
             if not ok:
                 response["error"] = message
@@ -185,10 +267,13 @@ class ContentAuditService:
             message = f"百度内容审核连接失败：{e}"
             return {
                 "ok": False,
+                "test_scope": scope,
                 "provider": getattr(provider, "name", provider_name),
+                "text_provider": getattr(text_provider, "name", text_provider_name),
                 "message": message,
                 "error": message,
                 "result": {"status": "error", "reason": str(e)},
+                "text_result": text_result or {"status": "error", "reason": str(e)},
             }
         finally:
             try:
@@ -233,6 +318,11 @@ class ContentAuditService:
         policy = normalize_send_policy(settings.get("send_policy"))
         return normalize_send_method((policy.get(audit_state) or {}).get(media_type), media_type)
 
+    @staticmethod
+    def _text_preview(text: str, limit: int = 160) -> str:
+        value = " ".join(str(text or "").split())
+        return value if len(value) <= limit else value[:limit] + "..."
+
     async def audit_images_for_task(self, task: Dict[str, Any], images: List[str]) -> Dict[str, Any]:
         origin = str(task.get("origin") or "")
         if origin not in {"command", "llm_tool"} or not images:
@@ -276,6 +366,7 @@ class ContentAuditService:
                 "port_name": task.get("port_name") or "",
                 "image_url": image_url,
                 "thumbnail": image_url,
+                "media_type": "image",
                 "status": status,
                 "decision": decision,
                 "audit_state": audit_state,
@@ -298,6 +389,74 @@ class ContentAuditService:
                 allowed.append(image_url)
         self._write_records(records)
         return {"allowed_images": allowed, "blocked": blocked, "records": made}
+
+    async def audit_texts_for_task(self, task: Dict[str, Any], texts: List[str]) -> Dict[str, Any]:
+        origin = str(task.get("origin") or "")
+        text_values = [str(text) for text in (texts or []) if str(text or "").strip()]
+        if origin not in {"command", "llm_tool"} or not text_values:
+            return {"allowed_texts": list(texts or []), "blocked": [], "records": []}
+
+        settings = self.load_settings()
+        if not settings.get("enabled", True):
+            return {"allowed_texts": list(texts or []), "blocked": [], "records": []}
+        text_provider = self._text_provider_for_settings(settings)
+
+        records = self._read_records()
+        allowed: List[str] = []
+        blocked: List[str] = []
+        made: List[Dict[str, Any]] = []
+        for index, text in enumerate(text_values, 1):
+            try:
+                result = await text_provider.audit_text(text, {"task": task, "index": index})
+            except Exception as e:
+                result = {
+                    "status": "error",
+                    "categories": [],
+                    "scores": {},
+                    "reason": f"文本审核执行失败：{e}",
+                    "provider": getattr(text_provider, "name", DEFAULT_TEXT_PROVIDER),
+                    "raw": {},
+                }
+            status = normalize_status(result.get("status"))
+            decision = self._decision_for_status(status, settings)
+            audit_state = self._audit_state_for_record(status, decision)
+            send_method = self._send_method_for_audit_state(settings, audit_state, "text")
+            record = {
+                "id": new_record_id(),
+                "task_id": str(task.get("task_id") or ""),
+                "prompt_id": str(task.get("prompt_id") or ""),
+                "origin": origin,
+                "origin_label": task.get("origin_label") or origin,
+                "session_label": task.get("session_label") or "",
+                "session_key": task.get("session_key") or "",
+                "workflow_name": task.get("workflow_name") or "",
+                "workflow_file": task.get("workflow_file") or "",
+                "port_name": task.get("port_name") or "",
+                "media_type": "text",
+                "text_index": index,
+                "text_preview": self._text_preview(text),
+                "status": status,
+                "decision": decision,
+                "audit_state": audit_state,
+                "send_method": send_method,
+                "sent": send_method != "dont_send",
+                "reason": str(result.get("reason") or ""),
+                "categories": result.get("categories") or [],
+                "scores": result.get("scores") or {},
+                "provider": result.get("provider") or getattr(text_provider, "name", DEFAULT_TEXT_PROVIDER),
+                "manual": False,
+                "created_at": now_ts(),
+                "updated_at": now_ts(),
+                "raw": result.get("raw") or {},
+            }
+            records.append(record)
+            made.append(public_record(record))
+            if send_method == "dont_send":
+                blocked.append(text)
+            else:
+                allowed.append(text)
+        self._write_records(records)
+        return {"allowed_texts": allowed, "blocked": blocked, "records": made}
 
     def list_records(self, filters: Dict[str, Any] | None = None) -> Dict[str, Any]:
         filters = filters or {}

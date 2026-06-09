@@ -568,6 +568,70 @@ def _build_media_delivery_report(media_type: str, items: List[Dict[str, Any]]) -
     }
 
 
+def _build_text_delivery_report(texts: List[str], audit_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    groups: Dict[tuple[str, str, bool], Dict[str, Any]] = {}
+    for record in audit_records or []:
+        method = normalize_send_method(record.get("send_method"), "text")
+        audit_state = str(record.get("audit_state") or "audit_disabled")
+        queued = method != "dont_send"
+        key = (audit_state, method, queued)
+        group = groups.setdefault(
+            key,
+            {
+                "audit_state": audit_state,
+                "send_method": method,
+                "queued": queued,
+                "count": 0,
+                "text_indexes": [],
+                "previews": [],
+            },
+        )
+        group["count"] += 1
+        index = record.get("text_index")
+        if index:
+            group["text_indexes"].append(index)
+        preview = str(record.get("text_preview") or "").strip()
+        if preview:
+            group["previews"].append(preview)
+    ordered_groups = sorted(
+        groups.values(),
+        key=lambda group: (
+            {"audit_disabled": 0, "audit_pass": 1, "audit_hit": 2, "audit_error": 3}.get(group["audit_state"], 9),
+            group["send_method"],
+            not group["queued"],
+        ),
+    )
+    queued_count = sum(1 for record in audit_records or [] if normalize_send_method(record.get("send_method"), "text") != "dont_send")
+    return {
+        "generated_count": len([text for text in texts or [] if str(text or "").strip()]),
+        "queued_count": queued_count,
+        "skipped_count": max(0, len(audit_records or []) - queued_count),
+        "groups": ordered_groups,
+    }
+
+
+async def _audit_texts_for_delivery(prompt_id: str, texts: List[str]) -> tuple[List[str], Dict[str, Any]]:
+    raw_texts = [str(text) for text in (texts or []) if str(text or "").strip()]
+    if not raw_texts:
+        return [], {}
+    task_for_audit = None
+    if _task_service and hasattr(_task_service, "get_external_task"):
+        try:
+            task_for_audit = _task_service.get_external_task(prompt_id)
+        except Exception as e:
+            logger.warning("ComfyUI task center lookup for text audit failed: %s", e)
+    if _task_service and task_for_audit and hasattr(_task_service, "audit_task_texts"):
+        try:
+            audit_result = await _task_service.audit_task_texts(task_for_audit, raw_texts)
+            records = audit_result.get("records") if isinstance(audit_result, dict) else []
+            if records:
+                allowed_texts = [str(text) for text in (audit_result.get("allowed_texts") or []) if str(text or "").strip()]
+                return allowed_texts, _build_text_delivery_report(raw_texts, records)
+        except Exception as e:
+            logger.warning("ComfyUI text audit failed: %s", e)
+    return _filter_generated_texts_for_delivery(raw_texts), {}
+
+
 def _llm_media_delivery_message(media_label: str = "Media") -> str:
     return (
         f"{media_label} is queued for automatic sending by the plugin. "
@@ -1415,6 +1479,7 @@ async def _append_completed_task_result(
             }
         )
         return
+    texts, text_delivery_report = await _audit_texts_for_delivery(prompt_id, texts)
     completed_task: Optional[Dict[str, Any]] = None
     if _task_service:
         try:
@@ -1466,8 +1531,9 @@ async def _append_completed_task_result(
                 "skipped_video_count": skipped_video_count,
                 "audio_count": len(audios),
                 "media_delivery_report": {"image": image_report} if image_delivery_items else {},
-                "texts": _filter_generated_texts_for_delivery(texts),
-                "description": "\n\n".join(_filter_generated_texts_for_delivery(texts)).strip(),
+                "text_delivery_report": text_delivery_report,
+                "texts": texts,
+                "description": "\n\n".join(texts).strip(),
                 "delivery": "partial_audit_block" if blocked_count and any_sendable else ("blocked_by_audit" if blocked_count else ("skipped_by_send_policy" if (skipped_count + skipped_video_count) and not any_sendable else ("queued_by_plugin" if any_sendable else ""))),
                 "reason": "内容审核拦截，未自动发送。" if blocked_count and not any_sendable else ("按发送策略跳过，未自动发送。" if (skipped_count + skipped_video_count) and not any_sendable else ""),
                 "message": _llm_media_delivery_message_from_report(image_report, sendable_video_count),
@@ -1475,13 +1541,14 @@ async def _append_completed_task_result(
         )
         return
     if not url:
-        filtered_texts = _filter_generated_texts_for_delivery(texts)
+        filtered_texts = texts
         results.append(
             {
                 "task_id": prompt_id,
                 "status": "completed",
                 "type": "text" if filtered_texts else "unknown",
                 "texts": filtered_texts,
+                "text_delivery_report": text_delivery_report,
                 "message": "\n\n".join(filtered_texts) if filtered_texts else "no output file",
             }
         )
@@ -1506,7 +1573,7 @@ async def _append_completed_task_result(
             _session_image_url_queue.setdefault(task_session_key, []).extend(image_delivery_items)
         blocked_count = len(audit_result.get("blocked") or [])
         skipped_count = int(image_report.get("skipped_count") or 0)
-        filtered_texts = _filter_generated_texts_for_delivery(texts)
+        filtered_texts = texts
         results.append(
             {
                 "task_id": prompt_id,
@@ -1519,6 +1586,7 @@ async def _append_completed_task_result(
                 "skipped_image_count": skipped_count,
                 "blocked_image_count": blocked_count,
                 "media_delivery_report": {"image": image_report},
+                "text_delivery_report": text_delivery_report,
                 "delivery": "blocked_by_audit" if blocked_count and not sendable_image_count else ("partial_audit_block" if blocked_count else ("skipped_by_send_policy" if skipped_count and not sendable_image_count else ("queued_by_plugin" if sendable_image_count else ""))),
                 "reason": "内容审核拦截，未自动发送。" if blocked_count and not sendable_image_count else ("按发送策略跳过，未自动发送。" if skipped_count and not sendable_image_count else ""),
                 "message": _llm_image_delivery_report_message(image_report),
@@ -1531,7 +1599,7 @@ async def _append_completed_task_result(
         sendable_video_count = sum(1 for item in video_delivery_items if item.get("send_method") != "dont_send")
         if video_delivery_items:
             _session_video_url_queue.setdefault(task_session_key, []).extend(video_delivery_items)
-        filtered_texts = _filter_generated_texts_for_delivery(texts)
+        filtered_texts = texts
         results.append(
             {
                 "task_id": prompt_id,
@@ -1546,11 +1614,12 @@ async def _append_completed_task_result(
                 "reason": "" if sendable_video_count else "按发送策略跳过，未自动发送。",
                 "message": _llm_media_delivery_message("Video") if sendable_video_count else "Video generated, but automatic sending was skipped by send policy.",
                 "texts": filtered_texts,
+                "text_delivery_report": text_delivery_report,
                 "description": "\n\n".join(filtered_texts).strip(),
             }
         )
     else:
-        filtered_texts = _filter_generated_texts_for_delivery(texts)
+        filtered_texts = texts
         results.append(
             {
                 "task_id": prompt_id,
@@ -1558,6 +1627,7 @@ async def _append_completed_task_result(
                 "type": ftype,
                 "url": url,
                 "texts": filtered_texts,
+                "text_delivery_report": text_delivery_report,
                 "description": "\n\n".join(filtered_texts).strip(),
             }
         )
@@ -2446,6 +2516,15 @@ class ComfyUIPlugin(Star):
         if not task or not images:
             return {"allowed_images": list(images), "blocked": [], "records": []}
         return await self._content_audit.audit_images_for_task(task, images)
+
+    def get_external_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        task = self._webui_debug_tasks.get(str(task_id))
+        return dict(task) if isinstance(task, dict) else None
+
+    async def audit_task_texts(self, task: Optional[Dict[str, Any]], texts: List[str]) -> Dict[str, Any]:
+        if not task or not texts:
+            return {"allowed_texts": list(texts or []), "blocked": [], "records": []}
+        return await self._content_audit.audit_texts_for_task(task, texts)
 
     def list_audit_records(self, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return self._content_audit.list_records(filters or {})
